@@ -8,7 +8,38 @@ type EditorTool = "brush" | "eraser" | "eyedropper";
 type BackgroundMode = "keep" | "transparent" | "colour";
 const PALETTE = MARD_221_PALETTE;
 const DRAFT_KEY = "pindou-workshop-draft-v1";
+const MIN_GRID_SIDE = 8;
+const MAX_GRID_SIDE = 160;
+const DEFAULT_DETAIL = 64;
 const paletteOrder = (code: string) => PALETTE.findIndex((bead) => bead.code === code);
+
+function dimensionsForAspect(aspect: number, longSide: number) {
+  const safeAspect = Number.isFinite(aspect) && aspect > 0 ? aspect : 1;
+  const longest = Math.max(MIN_GRID_SIDE, Math.min(MAX_GRID_SIDE, Math.round(longSide)));
+  if (safeAspect >= 1) {
+    return { columns: longest, rows: Math.max(MIN_GRID_SIDE, Math.min(MAX_GRID_SIDE, Math.round(longest / safeAspect))) };
+  }
+  return { columns: Math.max(MIN_GRID_SIDE, Math.min(MAX_GRID_SIDE, Math.round(longest * safeAspect))), rows: longest };
+}
+
+function aspectLabel(aspect: number) {
+  const safeAspect = Number.isFinite(aspect) && aspect > 0 ? aspect : 1;
+  let numerator = 1;
+  let denominator = 1;
+  let difference = Infinity;
+  for (let divisor = 1; divisor <= 12; divisor += 1) {
+    const candidate = Math.max(1, Math.round(safeAspect * divisor));
+    const delta = Math.abs(candidate / divisor - safeAspect);
+    if (delta < difference) {
+      numerator = candidate;
+      denominator = divisor;
+      difference = delta;
+    }
+  }
+  const greatestCommonDivisor = (first: number, second: number): number => second ? greatestCommonDivisor(second, first % second) : first;
+  const divisor = greatestCommonDivisor(numerator, denominator);
+  return `${numerator / divisor} : ${denominator / divisor}`;
+}
 
 function closestBead(red: number, green: number, blue: number, options: Bead[]) {
   const source = rgbToOklab(red, green, blue);
@@ -71,8 +102,8 @@ export default function Home() {
   const [projectName, setProjectName] = useState("未命名图纸");
   const [columns, setColumns] = useState(48);
   const [rows, setRows] = useState(48);
-  const [columnInput, setColumnInput] = useState("48");
-  const [rowInput, setRowInput] = useState("48");
+  const [detail, setDetail] = useState(DEFAULT_DETAIL);
+  const [sourceAspect, setSourceAspect] = useState(1);
   const [maxColors, setMaxColors] = useState(36);
   const [activeView, setActiveView] = useState<"pattern" | "source">("pattern");
   const [imageUrl, setImageUrl] = useState<string | null>(null);
@@ -116,28 +147,49 @@ export default function Home() {
 
   const recipeSignature = useMemo(() => JSON.stringify({ columns, rows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, lockedCodes: [...lockedCodes].sort() }), [backgroundCode, backgroundMode, backgroundTolerance, columns, cropOffsetX, cropOffsetY, cropZoom, lockedCodes, maxColors, rotation, rows]);
   const requiresRegeneration = Boolean(cells.length && generatedSignature !== recipeSignature);
+  const displayAspect = rotation % 180 === 0 ? sourceAspect : 1 / sourceAspect;
+
+  const applyDetail = (nextDetail: number, nextSourceAspect = sourceAspect, nextRotation = rotation) => {
+    const rotatedAspect = nextRotation % 180 === 0 ? nextSourceAspect : 1 / nextSourceAspect;
+    const planned = dimensionsForAspect(rotatedAspect, nextDetail);
+    setDetail(nextDetail);
+    setColumns(planned.columns);
+    setRows(planned.rows);
+  };
 
   const handleFile = (file?: File) => {
     if (!file || !file.type.startsWith("image/")) return;
     const url = URL.createObjectURL(file);
-    setImageUrl(url);
-    cellsRef.current = [];
-    setCells([]);
-    setHistory([]);
-    setFuture([]);
-    setRotation(0);
-    setCropZoom(100);
-    setCropOffsetX(0);
-    setCropOffsetY(0);
-    setGeneratedSignature("");
-    setGeneratedColumns(columns);
-    setGeneratedRows(rows);
-    setActiveView("source");
-    setIsLanding(false);
-    window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
+    const image = new Image();
+    image.onload = () => {
+      const nextSourceAspect = image.naturalWidth / image.naturalHeight;
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      setSourceAspect(nextSourceAspect);
+      applyDetail(DEFAULT_DETAIL, nextSourceAspect, 0);
+      setImageUrl(url);
+      cellsRef.current = [];
+      setCells([]);
+      setHistory([]);
+      setFuture([]);
+      setRotation(0);
+      setCropZoom(100);
+      setCropOffsetX(0);
+      setCropOffsetY(0);
+      setGeneratedSignature("");
+      setGeneratedColumns(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).columns);
+      setGeneratedRows(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).rows);
+      setActiveView("source");
+      setIsLanding(false);
+      window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
+    };
+    image.onerror = () => URL.revokeObjectURL(url);
+    image.src = url;
   };
 
-  const selectFile = (event: ChangeEvent<HTMLInputElement>) => handleFile(event.target.files?.[0]);
+  const selectFile = (event: ChangeEvent<HTMLInputElement>) => {
+    handleFile(event.target.files?.[0]);
+    event.target.value = "";
+  };
 
   const commitCells = (next: Cell[]) => {
     const current = cellsRef.current;
@@ -186,7 +238,7 @@ export default function Home() {
 
   const saveDraft = () => {
     if (!cells.length) { setDraftMessage("请先生成图纸"); return; }
-    const draft = { projectName, columns, rows, generatedColumns, generatedRows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, lockedCodes, cells: cells.map((bead) => bead?.code ?? null), generatedSignature };
+    const draft = { projectName, columns, rows, detail, sourceAspect, generatedColumns, generatedRows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, lockedCodes, cells: cells.map((bead) => bead?.code ?? null), generatedSignature };
     window.localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
     setDraftMessage("草稿已保存在本机");
     window.setTimeout(() => setDraftMessage(""), 2500);
@@ -215,7 +267,7 @@ export default function Home() {
       try {
         const saved = window.localStorage.getItem(DRAFT_KEY);
         if (!saved) return;
-        const draft = JSON.parse(saved) as { projectName: string; columns: number; rows: number; generatedColumns?: number; generatedRows?: number; maxColors: number; rotation: number; cropZoom: number; cropOffsetX: number; cropOffsetY: number; backgroundMode: BackgroundMode; backgroundCode: string; backgroundTolerance: number; lockedCodes: string[]; cells: Array<string | null>; generatedSignature?: string };
+        const draft = JSON.parse(saved) as { projectName: string; columns: number; rows: number; detail?: number; sourceAspect?: number; generatedColumns?: number; generatedRows?: number; maxColors: number; rotation: number; cropZoom: number; cropOffsetX: number; cropOffsetY: number; backgroundMode: BackgroundMode; backgroundCode: string; backgroundTolerance: number; lockedCodes: string[]; cells: Array<string | null>; generatedSignature?: string };
         const restoredCells = draft.cells.map((code) => code ? PALETTE.find((bead) => bead.code === code) ?? null : null);
         if (!restoredCells.length) return;
         let restoredGeneratedColumns = draft.generatedColumns ?? draft.columns;
@@ -235,7 +287,7 @@ export default function Home() {
         const recoveredSignature = JSON.stringify({ columns: restoredGeneratedColumns, rows: restoredGeneratedRows, maxColors: draft.maxColors, rotation: draft.rotation, cropZoom: draft.cropZoom, cropOffsetX: draft.cropOffsetX, cropOffsetY: draft.cropOffsetY, backgroundMode: draft.backgroundMode, backgroundCode: draft.backgroundCode, backgroundTolerance: draft.backgroundTolerance, lockedCodes: [...draft.lockedCodes].sort() });
         const legacyDraft = draft.generatedColumns === undefined || draft.generatedRows === undefined;
         const restoredSignature = recoveredDimensions || legacyDraft ? recoveredSignature : draft.generatedSignature ?? recoveredSignature;
-        setProjectName(draft.projectName); setColumns(draft.columns); setRows(draft.rows); setColumnInput(String(draft.columns)); setRowInput(String(draft.rows)); setGeneratedColumns(restoredGeneratedColumns); setGeneratedRows(restoredGeneratedRows); setMaxColors(draft.maxColors); setRotation(draft.rotation); setCropZoom(draft.cropZoom); setCropOffsetX(draft.cropOffsetX); setCropOffsetY(draft.cropOffsetY); setBackgroundMode(draft.backgroundMode); setBackgroundCode(draft.backgroundCode); setBackgroundTolerance(draft.backgroundTolerance); setLockedCodes(draft.lockedCodes); cellsRef.current = restoredCells; setCells(restoredCells); setGeneratedSignature(restoredSignature); setDraftMessage("已恢复本机草稿；原图不会保留"); setIsLanding(false);
+        setProjectName(draft.projectName); setColumns(draft.columns); setRows(draft.rows); setDetail(draft.detail ?? Math.max(draft.columns, draft.rows)); setSourceAspect(draft.sourceAspect ?? draft.columns / draft.rows); setGeneratedColumns(restoredGeneratedColumns); setGeneratedRows(restoredGeneratedRows); setMaxColors(draft.maxColors); setRotation(draft.rotation); setCropZoom(draft.cropZoom); setCropOffsetX(draft.cropOffsetX); setCropOffsetY(draft.cropOffsetY); setBackgroundMode(draft.backgroundMode); setBackgroundCode(draft.backgroundCode); setBackgroundTolerance(draft.backgroundTolerance); setLockedCodes(draft.lockedCodes); cellsRef.current = restoredCells; setCells(restoredCells); setGeneratedSignature(restoredSignature); setDraftMessage("已恢复本机草稿；原图不会保留"); setIsLanding(false);
       } catch { window.localStorage.removeItem(DRAFT_KEY); }
     }, 0);
     return () => window.clearTimeout(restoreTimer);
@@ -321,14 +373,6 @@ export default function Home() {
   const previewWidth = Math.round(previewBaseWidth * zoom / 100);
   const cellFontSize = Math.max(2.5, Math.min(9, (previewWidth / generatedColumns) * 0.54));
   const selectedBead = PALETTE.find((bead) => bead.code === selectedCode) ?? PALETTE[0];
-  const commitDimensionInput = (axis: "columns" | "rows") => {
-    const rawValue = axis === "columns" ? columnInput : rowInput;
-    const currentValue = axis === "columns" ? columns : rows;
-    const parsedValue = Number(rawValue);
-    const nextValue = rawValue === "" || !Number.isFinite(parsedValue) ? currentValue : Math.max(8, Math.min(160, Math.round(parsedValue)));
-    if (axis === "columns") { setColumns(nextValue); setColumnInput(String(nextValue)); }
-    else { setRows(nextValue); setRowInput(String(nextValue)); }
-  };
 
   const fitGridToStage = () => {
     const stageWidth = stageRef.current?.clientWidth ?? previewBaseWidth + 82;
@@ -522,15 +566,20 @@ export default function Home() {
             <ToolIcon name="upload" /><strong>{imageUrl ? "更换图片" : "上传参考图片"}</strong><span>JPG、PNG、WebP · 本地处理</span>
           </div>
 
-          <label className="control-label">成品网格 <span>{columns} × {rows}</span></label>
-          <div className="number-pair"><input type="number" inputMode="numeric" min="8" max="160" value={columnInput} onChange={(event) => { const value = event.target.value; setColumnInput(value); if (value !== "" && Number(value) >= 8 && Number(value) <= 160) setColumns(Math.round(Number(value))); }} onBlur={() => commitDimensionInput("columns")} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="网格列数" /><span>×</span><input type="number" inputMode="numeric" min="8" max="160" value={rowInput} onChange={(event) => { const value = event.target.value; setRowInput(value); if (value !== "" && Number(value) >= 8 && Number(value) <= 160) setRows(Math.round(Number(value))); }} onBlur={() => commitDimensionInput("rows")} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="网格行数" /></div>
-          <div className="slider-row"><span>细节</span><input type="range" min="16" max="120" value={columns} onChange={(event) => { const value = Number(event.target.value); setColumns(value); setRows(value); setColumnInput(String(value)); setRowInput(String(value)); }} /><span>精细</span></div>
+          <label className="control-label">图纸比例 <span>{columns} × {rows}</span></label>
+          <div className="ratio-locked" role="status">
+            <div className="ratio-size"><strong>{columns}</strong><i>×</i><strong>{rows}</strong></div>
+            <div><b>已锁定原图比例</b><small>{aspectLabel(displayAspect)} · 尺寸将始终同步缩放</small></div>
+          </div>
+          <label className="control-label detail-label">细节密度 <span>长边 {detail} 格</span></label>
+          <div className="slider-row"><span>粗糙</span><input type="range" min="16" max={MAX_GRID_SIDE} value={detail} onChange={(event) => applyDetail(Number(event.target.value))} aria-label="细节密度，向右更精细" /><span>精细</span></div>
+          <p className="ratio-help">拖动细节密度会同时调整长和宽，比例始终与图片保持一致。</p>
           {requiresRegeneration && <div className="pending-generation" role="status"><span>待更新</span><p>当前画布仍保持 {generatedColumns} × {generatedRows}。按下重新生成后，才会应用 {columns} × {rows} 的新设置。</p></div>}
 
           <label className="control-label">最多使用颜色 <span>{maxColors} 色</span></label>
           <div className="colour-options">{[12, 24, 36, 60, 221].map((number) => <button key={number} onClick={() => setMaxColors(number)} className={maxColors === number ? "selected" : ""}>{number === 221 ? "完整" : number}</button>)}</div>
 
-          {imageUrl && <div className="crop-section"><label className="control-label">裁剪与旋转 <span>实时预览</span></label><div className="rotation-row"><button onClick={() => setRotation((value) => (value + 270) % 360)} title="向左旋转 90 度">↶ 向左</button><span>{rotation === 0 ? "原始方向" : `已旋转 ${rotation}°`}</span><button onClick={() => setRotation((value) => (value + 90) % 360)} title="向右旋转 90 度">向右 ↷</button></div><label className="crop-slider"><span>放大取景</span><output>{cropZoom}%</output><input type="range" min="100" max="240" value={cropZoom} onChange={(event) => setCropZoom(Number(event.target.value))} /></label><label className="crop-slider"><span>横向移动</span><output>{cropOffsetX}</output><input type="range" min="-100" max="100" value={cropOffsetX} onChange={(event) => setCropOffsetX(Number(event.target.value))} /></label><label className="crop-slider"><span>纵向移动</span><output>{cropOffsetY}</output><input type="range" min="-100" max="100" value={cropOffsetY} onChange={(event) => setCropOffsetY(Number(event.target.value))} /></label><button className="reset-crop" onClick={() => { setRotation(0); setCropZoom(100); setCropOffsetX(0); setCropOffsetY(0); }}>恢复原图</button></div>}
+          {imageUrl && <div className="crop-section"><label className="control-label">裁剪与旋转 <span>实时预览</span></label><div className="rotation-row"><button onClick={() => setRotation((value) => { const next = (value + 270) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向左旋转 90 度">↶ 向左</button><span>{rotation === 0 ? "原始方向" : `已旋转 ${rotation}°`}</span><button onClick={() => setRotation((value) => { const next = (value + 90) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向右旋转 90 度">向右 ↷</button></div><label className="crop-slider"><span>放大取景</span><output>{cropZoom}%</output><input type="range" min="100" max="240" value={cropZoom} onChange={(event) => setCropZoom(Number(event.target.value))} /></label><label className="crop-slider"><span>横向移动</span><output>{cropOffsetX}</output><input type="range" min="-100" max="100" value={cropOffsetX} onChange={(event) => setCropOffsetX(Number(event.target.value))} /></label><label className="crop-slider"><span>纵向移动</span><output>{cropOffsetY}</output><input type="range" min="-100" max="100" value={cropOffsetY} onChange={(event) => setCropOffsetY(Number(event.target.value))} /></label><button className="reset-crop" onClick={() => { setRotation(0); applyDetail(detail, sourceAspect, 0); setCropZoom(100); setCropOffsetX(0); setCropOffsetY(0); }}>恢复原图</button></div>}
 
           {imageUrl && <div className="background-section"><label className="control-label">背景处理 <span>{backgroundMode === "keep" ? "保留" : backgroundMode === "transparent" ? "自动删除" : `替换为 ${backgroundCode}`}</span></label><div className="background-options"><button onClick={() => setBackgroundMode("keep")} className={backgroundMode === "keep" ? "selected" : ""}>保留</button><button onClick={() => setBackgroundMode("transparent")} className={backgroundMode === "transparent" ? "selected" : ""}>删除</button><button onClick={() => setBackgroundMode("colour")} className={backgroundMode === "colour" ? "selected" : ""}>指定色号</button></div>{backgroundMode !== "keep" && <><label className="crop-slider"><span>识别范围</span><output>{backgroundTolerance}</output><input type="range" min="8" max="55" value={backgroundTolerance} onChange={(event) => setBackgroundTolerance(Number(event.target.value))} /></label>{backgroundMode === "colour" && <label className="background-colour"><span>背景色号</span><select value={backgroundCode} onChange={(event) => setBackgroundCode(event.target.value)}>{PALETTE.map((bead) => <option key={bead.code} value={bead.code}>{bead.code} · {bead.name}</option>)}</select></label>}<p>仅处理与画面边缘连续、且接近角落颜色的区域。</p></>}</div>}
 
