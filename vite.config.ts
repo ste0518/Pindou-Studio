@@ -44,6 +44,9 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    // GitHub Pages project sites are hosted below /<repository>/ rather than
+    // the domain root. Relative client asset URLs work in both locations.
+    base: process.env.GITHUB_ACTIONS === "true" ? "./" : "/",
     server: isCodexSeatbeltSandbox
       ? { watch: { useFsEvents: false, usePolling: true } }
       : undefined,
