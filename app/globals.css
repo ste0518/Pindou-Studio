@@ -126,7 +126,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .canvas-stage { display: flex; justify-content: center; align-items: flex-start; height: 545px; overflow: auto; border: 1px solid #e4d2d5; border-radius: 17px; background-color: #fff5f4; background-image: linear-gradient(#f0e3e4 1px, transparent 1px), linear-gradient(90deg, #f0e3e4 1px, transparent 1px); background-size: 20px 20px; box-shadow: inset 0 1px 0 rgb(255 255 255 / 70%); }
 .source-crop-frame { position: relative; width: min(760px, calc(100% - 48px)); height: min(475px, calc(100% - 48px)); overflow: hidden; margin: auto; background: #39272e; box-shadow: 0 14px 28px rgb(74 44 53 / 14%); }
 .source-crop-frame::after { position: absolute; inset: 0; border: 2px solid var(--accent); content: ""; pointer-events: none; }
-.source-image { width: 100%; height: 100%; object-fit: cover; transform-origin: center; transition: transform .18s ease; }
+.source-image { width: 100%; height: 100%; object-fit: cover; transform-origin: center; image-orientation: from-image; transition: transform .18s ease; }
 .crop-frame-label { position: absolute; z-index: 1; left: 12px; bottom: 12px; padding: 7px 9px; border-radius: 6px; background: rgb(45 30 35 / 83%); color: #fffafa; font-size: 11px; font-weight: 700; }
 .pattern-wrap { position: relative; flex: 0 0 auto; margin: 42px 26px 26px 42px; box-shadow: 0 14px 26px rgb(74 44 53 / 16%); }
 .bead-grid { display: grid; border: 1.5px solid #655059; background: var(--surface); }

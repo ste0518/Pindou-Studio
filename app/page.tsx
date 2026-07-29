@@ -41,6 +41,55 @@ function aspectLabel(aspect: number) {
   return `${numerator / divisor} : ${denominator / divisor}`;
 }
 
+async function readExifOrientation(file: File) {
+  if (file.type !== "image/jpeg") return 1;
+  try {
+    const view = new DataView(await file.slice(0, 128 * 1024).arrayBuffer());
+    if (view.byteLength < 4 || view.getUint16(0, false) !== 0xffd8) return 1;
+    let offset = 2;
+    while (offset + 4 <= view.byteLength) {
+      const marker = view.getUint16(offset, false);
+      offset += 2;
+      if ((marker & 0xff00) !== 0xff00 || marker === 0xffda) break;
+      const length = view.getUint16(offset, false);
+      if (length < 2 || offset + length > view.byteLength) break;
+      const segmentStart = offset + 2;
+      if (marker === 0xffe1 && segmentStart + 14 <= view.byteLength && view.getUint32(segmentStart, false) === 0x45786966) {
+        const tiffStart = segmentStart + 6;
+        const littleEndian = view.getUint16(tiffStart, false) === 0x4949;
+        if (view.getUint16(tiffStart + 2, littleEndian) !== 0x002a) return 1;
+        const directoryStart = tiffStart + view.getUint32(tiffStart + 4, littleEndian);
+        const entries = view.getUint16(directoryStart, littleEndian);
+        for (let index = 0; index < entries; index += 1) {
+          const entry = directoryStart + 2 + index * 12;
+          if (entry + 12 > view.byteLength) break;
+          if (view.getUint16(entry, littleEndian) === 0x0112) return view.getUint16(entry + 8, littleEndian);
+        }
+      }
+      offset += length;
+    }
+  } catch {
+    // If metadata is absent or malformed, browsers can still read the photo normally.
+  }
+  return 1;
+}
+
+function drawExifOrientedImage(context: CanvasRenderingContext2D, image: HTMLImageElement, orientation: number) {
+  const width = image.naturalWidth;
+  const height = image.naturalHeight;
+  switch (orientation) {
+    case 2: context.setTransform(-1, 0, 0, 1, width, 0); break;
+    case 3: context.setTransform(-1, 0, 0, -1, width, height); break;
+    case 4: context.setTransform(1, 0, 0, -1, 0, height); break;
+    case 5: context.setTransform(0, 1, 1, 0, 0, 0); break;
+    case 6: context.setTransform(0, 1, -1, 0, height, 0); break;
+    case 7: context.setTransform(0, -1, -1, 0, height, width); break;
+    case 8: context.setTransform(0, -1, 1, 0, 0, width); break;
+    default: context.setTransform(1, 0, 0, 1, 0, 0);
+  }
+  context.drawImage(image, 0, 0);
+}
+
 function closestBead(red: number, green: number, blue: number, options: Bead[]) {
   const source = rgbToOklab(red, green, blue);
   return options.reduce((best, bead) => {
@@ -104,6 +153,7 @@ export default function Home() {
   const [rows, setRows] = useState(48);
   const [detail, setDetail] = useState(DEFAULT_DETAIL);
   const [sourceAspect, setSourceAspect] = useState(1);
+  const [exifOrientation, setExifOrientation] = useState(1);
   const [maxColors, setMaxColors] = useState(36);
   const [activeView, setActiveView] = useState<"pattern" | "source">("pattern");
   const [imageUrl, setImageUrl] = useState<string | null>(null);
@@ -159,31 +209,36 @@ export default function Home() {
 
   const handleFile = (file?: File) => {
     if (!file || !file.type.startsWith("image/")) return;
-    const url = URL.createObjectURL(file);
-    const image = new Image();
-    image.onload = () => {
-      const nextSourceAspect = image.naturalWidth / image.naturalHeight;
-      if (imageUrl) URL.revokeObjectURL(imageUrl);
-      setSourceAspect(nextSourceAspect);
-      applyDetail(DEFAULT_DETAIL, nextSourceAspect, 0);
-      setImageUrl(url);
-      cellsRef.current = [];
-      setCells([]);
-      setHistory([]);
-      setFuture([]);
-      setRotation(0);
-      setCropZoom(100);
-      setCropOffsetX(0);
-      setCropOffsetY(0);
-      setGeneratedSignature("");
-      setGeneratedColumns(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).columns);
-      setGeneratedRows(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).rows);
-      setActiveView("source");
-      setIsLanding(false);
-      window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
-    };
-    image.onerror = () => URL.revokeObjectURL(url);
-    image.src = url;
+    void (async () => {
+      const orientation = await readExifOrientation(file);
+      const url = URL.createObjectURL(file);
+      const image = new Image();
+      image.onload = () => {
+        const orientationSwapsSides = [5, 6, 7, 8].includes(orientation);
+        const nextSourceAspect = orientationSwapsSides ? image.naturalHeight / image.naturalWidth : image.naturalWidth / image.naturalHeight;
+        if (imageUrl) URL.revokeObjectURL(imageUrl);
+        setSourceAspect(nextSourceAspect);
+        setExifOrientation(orientation);
+        applyDetail(DEFAULT_DETAIL, nextSourceAspect, 0);
+        setImageUrl(url);
+        cellsRef.current = [];
+        setCells([]);
+        setHistory([]);
+        setFuture([]);
+        setRotation(0);
+        setCropZoom(100);
+        setCropOffsetX(0);
+        setCropOffsetY(0);
+        setGeneratedSignature("");
+        setGeneratedColumns(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).columns);
+        setGeneratedRows(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).rows);
+        setActiveView("source");
+        setIsLanding(false);
+        window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
+      };
+      image.onerror = () => URL.revokeObjectURL(url);
+      image.src = url;
+    })();
   };
 
   const selectFile = (event: ChangeEvent<HTMLInputElement>) => {
@@ -297,15 +352,23 @@ export default function Home() {
     if (!imageUrl) return;
     const image = new Image();
     image.onload = () => {
+      const exifSwapsSides = [5, 6, 7, 8].includes(exifOrientation);
+      const normalized = document.createElement("canvas");
+      normalized.width = exifSwapsSides ? image.naturalHeight : image.naturalWidth;
+      normalized.height = exifSwapsSides ? image.naturalWidth : image.naturalHeight;
+      const normalizedContext = normalized.getContext("2d");
+      if (!normalizedContext) return;
+      drawExifOrientedImage(normalizedContext, image, exifOrientation);
+
       const prepared = document.createElement("canvas");
       const rotated = rotation % 180 !== 0;
-      prepared.width = rotated ? image.naturalHeight : image.naturalWidth;
-      prepared.height = rotated ? image.naturalWidth : image.naturalHeight;
+      prepared.width = rotated ? normalized.height : normalized.width;
+      prepared.height = rotated ? normalized.width : normalized.height;
       const preparedContext = prepared.getContext("2d");
       if (!preparedContext) return;
       preparedContext.translate(prepared.width / 2, prepared.height / 2);
       preparedContext.rotate((rotation * Math.PI) / 180);
-      preparedContext.drawImage(image, -image.naturalWidth / 2, -image.naturalHeight / 2);
+      preparedContext.drawImage(normalized, -normalized.width / 2, -normalized.height / 2);
 
       const canvas = document.createElement("canvas");
       canvas.width = columns;
