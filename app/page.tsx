@@ -5,7 +5,9 @@ import { Bead, MARD_221_PALETTE, rgbToOklab } from "./palette";
 
 type Cell = Bead | null;
 type EditorTool = "brush" | "eraser" | "eyedropper";
-type BackgroundMode = "keep" | "transparent" | "colour";
+type BackgroundMode = "keep" | "transparent" | "colour" | "ai";
+type BackgroundRemovalResult = { data: Uint8ClampedArray; width: number; height: number };
+type BackgroundSegmenter = (image: HTMLCanvasElement) => Promise<BackgroundRemovalResult[]>;
 const PALETTE = MARD_221_PALETTE;
 const DRAFT_KEY = "pindou-workshop-draft-v1";
 const MIN_GRID_SIDE = 8;
@@ -99,7 +101,7 @@ function closestBead(red: number, green: number, blue: number, options: Bead[]) 
   });
 }
 
-function connectedBackgroundMask(data: Uint8ClampedArray, width: number, height: number, tolerance: number) {
+function connectedBackgroundMask(data: Uint8ClampedArray, width: number, height: number, tolerance: number, subjectProtection: number) {
   const references = [[0, 0], [width - 1, 0], [0, height - 1], [width - 1, height - 1]]
     .map(([x, y]) => (x + y * width) * 4)
     .filter((index) => data[index + 3] > 24)
@@ -107,26 +109,53 @@ function connectedBackgroundMask(data: Uint8ClampedArray, width: number, height:
   const mask = new Uint8Array(width * height);
   const checked = new Uint8Array(width * height);
   const queue: number[] = [];
+  const labs = Array.from({ length: width * height }, (_, pixel) => {
+    const index = pixel * 4;
+    return rgbToOklab(data[index], data[index + 1], data[index + 2]);
+  });
+  const referenceDistance = (pixel: number) => Math.min(...references.map((reference) => {
+    const colour = labs[pixel];
+    return Math.hypot(colour[0] - reference[0], colour[1] - reference[1], colour[2] - reference[2]);
+  }));
+  const isProtectedCore = (pixel: number) => {
+    const column = pixel % width;
+    const row = Math.floor(pixel / width);
+    const radius = 0.12 + Math.max(0, Math.min(100, subjectProtection)) * 0.0037;
+    const horizontal = (column - (width - 1) / 2) / ((width - 1) / 2 || 1);
+    const vertical = (row - (height - 1) / 2) / ((height - 1) / 2 || 1);
+    return (horizontal / radius) ** 2 + (vertical / radius) ** 2 <= 1;
+  };
+  const isTransparent = (pixel: number) => data[pixel * 4 + 3] <= 24;
+  const canRemove = (pixel: number) => {
+    if (isTransparent(pixel)) return true;
+    const distance = referenceDistance(pixel);
+    if (distance > tolerance) return false;
+    // Keep the likely subject core unless it is unmistakably the same as the border background.
+    return !isProtectedCore(pixel) || distance <= tolerance * 0.42;
+  };
+  const canFlow = (from: number, to: number) => {
+    if (!canRemove(to)) return false;
+    if (isTransparent(from) || isTransparent(to)) return true;
+    const first = labs[from];
+    const second = labs[to];
+    const localDifference = Math.hypot(first[0] - second[0], first[1] - second[1], first[2] - second[2]);
+    // A foreground edge normally causes a colour jump; do not allow the mask to cross it.
+    return localDifference <= Math.max(0.02, tolerance * 0.68) || referenceDistance(to) <= tolerance * 0.3;
+  };
   for (let column = 0; column < width; column += 1) { queue.push(column, column + (height - 1) * width); }
   for (let row = 1; row < height - 1; row += 1) { queue.push(row * width, row * width + width - 1); }
-  const similarToCorner = (pixel: number) => {
-    const index = pixel * 4;
-    if (data[index + 3] <= 24) return true;
-    const lab = rgbToOklab(data[index], data[index + 1], data[index + 2]);
-    return references.some((reference) => Math.hypot(lab[0] - reference[0], lab[1] - reference[1], lab[2] - reference[2]) <= tolerance);
-  };
   while (queue.length) {
     const pixel = queue.pop()!;
     if (checked[pixel]) continue;
     checked[pixel] = 1;
-    if (!similarToCorner(pixel)) continue;
+    if (!canRemove(pixel)) continue;
     mask[pixel] = 1;
     const column = pixel % width;
     const row = Math.floor(pixel / width);
-    if (column > 0) queue.push(pixel - 1);
-    if (column < width - 1) queue.push(pixel + 1);
-    if (row > 0) queue.push(pixel - width);
-    if (row < height - 1) queue.push(pixel + width);
+    if (column > 0 && canFlow(pixel, pixel - 1)) queue.push(pixel - 1);
+    if (column < width - 1 && canFlow(pixel, pixel + 1)) queue.push(pixel + 1);
+    if (row > 0 && canFlow(pixel, pixel - width)) queue.push(pixel - width);
+    if (row < height - 1 && canFlow(pixel, pixel + width)) queue.push(pixel + width);
   }
   return mask;
 }
@@ -169,7 +198,11 @@ export default function Home() {
   const [cropOffsetY, setCropOffsetY] = useState(0);
   const [backgroundMode, setBackgroundMode] = useState<BackgroundMode>("keep");
   const [backgroundCode, setBackgroundCode] = useState("H1");
-  const [backgroundTolerance, setBackgroundTolerance] = useState(22);
+  const [backgroundTolerance, setBackgroundTolerance] = useState(18);
+  const [subjectProtection, setSubjectProtection] = useState(68);
+  const [aiStatus, setAiStatus] = useState("");
+  const [aiError, setAiError] = useState("");
+  const [isGenerating, setIsGenerating] = useState(false);
   const [zoom, setZoom] = useState(100);
   const [lockedCodes, setLockedCodes] = useState<string[]>([]);
   const [generatedSignature, setGeneratedSignature] = useState("");
@@ -184,6 +217,7 @@ export default function Home() {
   const stageRef = useRef<HTMLDivElement>(null);
   const cellsRef = useRef<Cell[]>([]);
   const isPainting = useRef(false);
+  const aiSegmenter = useRef<BackgroundSegmenter | null>(null);
 
   const counts = useMemo(() => {
     const map = new Map<string, { bead: Bead; count: number }>();
@@ -195,7 +229,7 @@ export default function Home() {
     return [...map.values()].sort((a, b) => paletteOrder(a.bead.code) - paletteOrder(b.bead.code));
   }, [cells]);
 
-  const recipeSignature = useMemo(() => JSON.stringify({ columns, rows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, lockedCodes: [...lockedCodes].sort() }), [backgroundCode, backgroundMode, backgroundTolerance, columns, cropOffsetX, cropOffsetY, cropZoom, lockedCodes, maxColors, rotation, rows]);
+  const recipeSignature = useMemo(() => JSON.stringify({ columns, rows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, subjectProtection, lockedCodes: [...lockedCodes].sort() }), [backgroundCode, backgroundMode, backgroundTolerance, columns, cropOffsetX, cropOffsetY, cropZoom, lockedCodes, maxColors, rotation, rows, subjectProtection]);
   const requiresRegeneration = Boolean(cells.length && generatedSignature !== recipeSignature);
   const displayAspect = rotation % 180 === 0 ? sourceAspect : 1 / sourceAspect;
 
@@ -205,6 +239,30 @@ export default function Home() {
     setDetail(nextDetail);
     setColumns(planned.columns);
     setRows(planned.rows);
+  };
+
+  const removeBackgroundWithAI = async (source: HTMLCanvasElement) => {
+    setAiError("");
+    if (!aiSegmenter.current) {
+      setAiStatus("正在准备 AI 人像分割模型…");
+      const { pipeline } = await import("@huggingface/transformers");
+      aiSegmenter.current = await pipeline("background-removal", "Xenova/modnet", {
+        progress_callback: (progress: { status?: string; progress?: number }) => {
+          const percentage = Number.isFinite(progress.progress) ? ` ${Math.round(progress.progress!)}%` : "";
+          setAiStatus(progress.status === "ready" ? "AI 模型已就绪，正在识别人物…" : `正在下载 AI 模型${percentage}`);
+        },
+      }) as unknown as BackgroundSegmenter;
+    }
+    setAiStatus("正在识别人物、头发和衣物轮廓…");
+    const [result] = await aiSegmenter.current(source);
+    const output = document.createElement("canvas");
+    output.width = result.width;
+    output.height = result.height;
+    const outputContext = output.getContext("2d");
+    if (!outputContext) throw new Error("无法创建 AI 图像画布");
+    outputContext.putImageData(new ImageData(new Uint8ClampedArray(result.data), result.width, result.height), 0, 0);
+    setAiStatus("AI 精准抠图完成");
+    return output;
   };
 
   const handleFile = (file?: File) => {
@@ -229,6 +287,8 @@ export default function Home() {
         setCropZoom(100);
         setCropOffsetX(0);
         setCropOffsetY(0);
+        setAiStatus("");
+        setAiError("");
         setGeneratedSignature("");
         setGeneratedColumns(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).columns);
         setGeneratedRows(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).rows);
@@ -293,7 +353,7 @@ export default function Home() {
 
   const saveDraft = () => {
     if (!cells.length) { setDraftMessage("请先生成图纸"); return; }
-    const draft = { projectName, columns, rows, detail, sourceAspect, generatedColumns, generatedRows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, lockedCodes, cells: cells.map((bead) => bead?.code ?? null), generatedSignature };
+    const draft = { projectName, columns, rows, detail, sourceAspect, generatedColumns, generatedRows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, subjectProtection, lockedCodes, cells: cells.map((bead) => bead?.code ?? null), generatedSignature };
     window.localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
     setDraftMessage("草稿已保存在本机");
     window.setTimeout(() => setDraftMessage(""), 2500);
@@ -322,7 +382,7 @@ export default function Home() {
       try {
         const saved = window.localStorage.getItem(DRAFT_KEY);
         if (!saved) return;
-        const draft = JSON.parse(saved) as { projectName: string; columns: number; rows: number; detail?: number; sourceAspect?: number; generatedColumns?: number; generatedRows?: number; maxColors: number; rotation: number; cropZoom: number; cropOffsetX: number; cropOffsetY: number; backgroundMode: BackgroundMode; backgroundCode: string; backgroundTolerance: number; lockedCodes: string[]; cells: Array<string | null>; generatedSignature?: string };
+        const draft = JSON.parse(saved) as { projectName: string; columns: number; rows: number; detail?: number; sourceAspect?: number; generatedColumns?: number; generatedRows?: number; maxColors: number; rotation: number; cropZoom: number; cropOffsetX: number; cropOffsetY: number; backgroundMode: BackgroundMode; backgroundCode: string; backgroundTolerance: number; subjectProtection?: number; lockedCodes: string[]; cells: Array<string | null>; generatedSignature?: string };
         const restoredCells = draft.cells.map((code) => code ? PALETTE.find((bead) => bead.code === code) ?? null : null);
         if (!restoredCells.length) return;
         let restoredGeneratedColumns = draft.generatedColumns ?? draft.columns;
@@ -339,19 +399,22 @@ export default function Home() {
             restoredGeneratedRows = draft.rows;
           }
         }
-        const recoveredSignature = JSON.stringify({ columns: restoredGeneratedColumns, rows: restoredGeneratedRows, maxColors: draft.maxColors, rotation: draft.rotation, cropZoom: draft.cropZoom, cropOffsetX: draft.cropOffsetX, cropOffsetY: draft.cropOffsetY, backgroundMode: draft.backgroundMode, backgroundCode: draft.backgroundCode, backgroundTolerance: draft.backgroundTolerance, lockedCodes: [...draft.lockedCodes].sort() });
-        const legacyDraft = draft.generatedColumns === undefined || draft.generatedRows === undefined;
+        const recoveredSignature = JSON.stringify({ columns: restoredGeneratedColumns, rows: restoredGeneratedRows, maxColors: draft.maxColors, rotation: draft.rotation, cropZoom: draft.cropZoom, cropOffsetX: draft.cropOffsetX, cropOffsetY: draft.cropOffsetY, backgroundMode: draft.backgroundMode, backgroundCode: draft.backgroundCode, backgroundTolerance: draft.backgroundTolerance, subjectProtection: draft.subjectProtection ?? 68, lockedCodes: [...draft.lockedCodes].sort() });
+        const legacyDraft = draft.generatedColumns === undefined || draft.generatedRows === undefined || draft.subjectProtection === undefined;
         const restoredSignature = recoveredDimensions || legacyDraft ? recoveredSignature : draft.generatedSignature ?? recoveredSignature;
-        setProjectName(draft.projectName); setColumns(draft.columns); setRows(draft.rows); setDetail(draft.detail ?? Math.max(draft.columns, draft.rows)); setSourceAspect(draft.sourceAspect ?? draft.columns / draft.rows); setGeneratedColumns(restoredGeneratedColumns); setGeneratedRows(restoredGeneratedRows); setMaxColors(draft.maxColors); setRotation(draft.rotation); setCropZoom(draft.cropZoom); setCropOffsetX(draft.cropOffsetX); setCropOffsetY(draft.cropOffsetY); setBackgroundMode(draft.backgroundMode); setBackgroundCode(draft.backgroundCode); setBackgroundTolerance(draft.backgroundTolerance); setLockedCodes(draft.lockedCodes); cellsRef.current = restoredCells; setCells(restoredCells); setGeneratedSignature(restoredSignature); setDraftMessage("已恢复本机草稿；原图不会保留"); setIsLanding(false);
+        setProjectName(draft.projectName); setColumns(draft.columns); setRows(draft.rows); setDetail(draft.detail ?? Math.max(draft.columns, draft.rows)); setSourceAspect(draft.sourceAspect ?? draft.columns / draft.rows); setGeneratedColumns(restoredGeneratedColumns); setGeneratedRows(restoredGeneratedRows); setMaxColors(draft.maxColors); setRotation(draft.rotation); setCropZoom(draft.cropZoom); setCropOffsetX(draft.cropOffsetX); setCropOffsetY(draft.cropOffsetY); setBackgroundMode(draft.backgroundMode); setBackgroundCode(draft.backgroundCode); setBackgroundTolerance(draft.backgroundTolerance); setSubjectProtection(draft.subjectProtection ?? 68); setLockedCodes(draft.lockedCodes); cellsRef.current = restoredCells; setCells(restoredCells); setGeneratedSignature(restoredSignature); setDraftMessage("已恢复本机草稿；原图不会保留"); setIsLanding(false);
       } catch { window.localStorage.removeItem(DRAFT_KEY); }
     }, 0);
     return () => window.clearTimeout(restoreTimer);
   }, []);
 
   const generate = () => {
-    if (!imageUrl) return;
+    if (!imageUrl || isGenerating) return;
+    setIsGenerating(true);
+    setAiError("");
     const image = new Image();
-    image.onload = () => {
+    image.onload = async () => {
+      try {
       const exifSwapsSides = [5, 6, 7, 8].includes(exifOrientation);
       const normalized = document.createElement("canvas");
       normalized.width = exifSwapsSides ? image.naturalHeight : image.naturalWidth;
@@ -375,7 +438,6 @@ export default function Home() {
       canvas.height = rows;
       const context = canvas.getContext("2d", { willReadFrequently: true });
       if (!context) return;
-      context.imageSmoothingEnabled = false;
       const cropRatio = cropZoom / 100;
       const cropWidth = prepared.width / cropRatio;
       const cropHeight = prepared.height / cropRatio;
@@ -383,20 +445,55 @@ export default function Home() {
       const availableY = prepared.height - cropHeight;
       const sourceX = Math.max(0, Math.min(availableX, availableX / 2 + (cropOffsetX / 100) * (availableX / 2)));
       const sourceY = Math.max(0, Math.min(availableY, availableY / 2 + (cropOffsetY / 100) * (availableY / 2)));
-      context.drawImage(prepared, sourceX, sourceY, cropWidth, cropHeight, 0, 0, columns, rows);
+      if (backgroundMode !== "keep") {
+        // Detect the background before reducing the image to a small bead grid.
+        // At this resolution, a subject edge has enough information to act as a barrier.
+        const analysisScale = Math.max(4, Math.min(8, Math.floor(640 / Math.max(columns, rows)) || 4));
+        const analysisWidth = columns * analysisScale;
+        const analysisHeight = rows * analysisScale;
+        const analysisCanvas = document.createElement("canvas");
+        analysisCanvas.width = analysisWidth;
+        analysisCanvas.height = analysisHeight;
+        const analysisContext = analysisCanvas.getContext("2d", { willReadFrequently: true });
+        if (!analysisContext) return;
+        analysisContext.drawImage(prepared, sourceX, sourceY, cropWidth, cropHeight, 0, 0, analysisWidth, analysisHeight);
+        if (backgroundMode === "ai") {
+          try {
+            const aiOutput = await removeBackgroundWithAI(analysisCanvas);
+            analysisContext.clearRect(0, 0, analysisWidth, analysisHeight);
+            analysisContext.drawImage(aiOutput, 0, 0, analysisWidth, analysisHeight);
+          } catch (error) {
+            setAiError("AI 抠图暂时不可用，已改用主体保护模式。请检查网络后重试。");
+            const analysisImageData = analysisContext.getImageData(0, 0, analysisWidth, analysisHeight);
+            const analysisData = analysisImageData.data;
+            const backgroundMask = connectedBackgroundMask(analysisData, analysisWidth, analysisHeight, backgroundTolerance / 500, subjectProtection);
+            backgroundMask.forEach((isBackground, pixel) => {
+              if (isBackground) analysisData[pixel * 4 + 3] = 0;
+            });
+            analysisContext.putImageData(analysisImageData, 0, 0);
+            console.warn("AI background removal failed", error);
+          }
+        } else {
+          const analysisImageData = analysisContext.getImageData(0, 0, analysisWidth, analysisHeight);
+          const analysisData = analysisImageData.data;
+          const backgroundMask = connectedBackgroundMask(analysisData, analysisWidth, analysisHeight, backgroundTolerance / 500, subjectProtection);
+          const replacement = PALETTE.find((bead) => bead.code === backgroundCode) ?? PALETTE[0];
+          backgroundMask.forEach((isBackground, pixel) => {
+            if (!isBackground) return;
+            const index = pixel * 4;
+            if (backgroundMode === "transparent") analysisData[index + 3] = 0;
+            else { analysisData[index] = replacement.rgb[0]; analysisData[index + 1] = replacement.rgb[1]; analysisData[index + 2] = replacement.rgb[2]; analysisData[index + 3] = 255; }
+          });
+          analysisContext.putImageData(analysisImageData, 0, 0);
+        }
+        context.imageSmoothingEnabled = true;
+        context.drawImage(analysisCanvas, 0, 0, columns, rows);
+      } else {
+        context.imageSmoothingEnabled = false;
+        context.drawImage(prepared, sourceX, sourceY, cropWidth, cropHeight, 0, 0, columns, rows);
+      }
       const imageData = context.getImageData(0, 0, columns, rows);
       const data = imageData.data;
-      if (backgroundMode !== "keep") {
-        const backgroundMask = connectedBackgroundMask(data, columns, rows, backgroundTolerance / 500);
-        const replacement = PALETTE.find((bead) => bead.code === backgroundCode) ?? PALETTE[0];
-        backgroundMask.forEach((isBackground, pixel) => {
-          if (!isBackground) return;
-          const index = pixel * 4;
-          if (backgroundMode === "transparent") data[index + 3] = 0;
-          else { data[index] = replacement.rgb[0]; data[index + 1] = replacement.rgb[1]; data[index + 2] = replacement.rgb[2]; data[index + 3] = 255; }
-        });
-        context.putImageData(imageData, 0, 0);
-      }
       const initialMatches: Cell[] = [];
       for (let pixel = 0; pixel < data.length; pixel += 4) {
         initialMatches.push(data[pixel + 3] < 24 ? null : closestBead(data[pixel], data[pixel + 1], data[pixel + 2], PALETTE));
@@ -423,6 +520,15 @@ export default function Home() {
       setJumpRow(1);
       setJumpColumn(1);
       window.setTimeout(() => stageRef.current?.scrollTo({ top: 0, left: 0 }), 0);
+      } catch (error) {
+        setAiError(error instanceof Error ? `生成失败：${error.message}` : "生成失败，请更换图片后重试。");
+      } finally {
+        setIsGenerating(false);
+      }
+    };
+    image.onerror = () => {
+      setAiError("图片读取失败，请重新上传后再试。");
+      setIsGenerating(false);
     };
     image.src = imageUrl;
   };
@@ -645,11 +751,12 @@ export default function Home() {
 
           {imageUrl && <div className="crop-section"><label className="control-label">裁剪与旋转 <span>实时预览</span></label><div className="rotation-row"><button onClick={() => setRotation((value) => { const next = (value + 270) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向左旋转 90 度">↶ 向左</button><span>{rotation === 0 ? "原始方向" : `已旋转 ${rotation}°`}</span><button onClick={() => setRotation((value) => { const next = (value + 90) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向右旋转 90 度">向右 ↷</button></div><label className="crop-slider"><span>放大取景</span><output>{cropZoom}%</output><input type="range" min="100" max="240" value={cropZoom} onChange={(event) => setCropZoom(Number(event.target.value))} /></label><label className="crop-slider"><span>横向移动</span><output>{cropOffsetX}</output><input type="range" min="-100" max="100" value={cropOffsetX} onChange={(event) => setCropOffsetX(Number(event.target.value))} /></label><label className="crop-slider"><span>纵向移动</span><output>{cropOffsetY}</output><input type="range" min="-100" max="100" value={cropOffsetY} onChange={(event) => setCropOffsetY(Number(event.target.value))} /></label><button className="reset-crop" onClick={() => { setRotation(0); applyDetail(detail, sourceAspect, 0); setCropZoom(100); setCropOffsetX(0); setCropOffsetY(0); }}>恢复原图</button></div>}
 
-          {imageUrl && <div className="background-section"><label className="control-label">背景处理 <span>{backgroundMode === "keep" ? "保留" : backgroundMode === "transparent" ? "自动删除" : `替换为 ${backgroundCode}`}</span></label><div className="background-options"><button onClick={() => setBackgroundMode("keep")} className={backgroundMode === "keep" ? "selected" : ""}>保留</button><button onClick={() => setBackgroundMode("transparent")} className={backgroundMode === "transparent" ? "selected" : ""}>删除</button><button onClick={() => setBackgroundMode("colour")} className={backgroundMode === "colour" ? "selected" : ""}>指定色号</button></div>{backgroundMode !== "keep" && <><label className="crop-slider"><span>识别范围</span><output>{backgroundTolerance}</output><input type="range" min="8" max="55" value={backgroundTolerance} onChange={(event) => setBackgroundTolerance(Number(event.target.value))} /></label>{backgroundMode === "colour" && <label className="background-colour"><span>背景色号</span><select value={backgroundCode} onChange={(event) => setBackgroundCode(event.target.value)}>{PALETTE.map((bead) => <option key={bead.code} value={bead.code}>{bead.code} · {bead.name}</option>)}</select></label>}<p>仅处理与画面边缘连续、且接近角落颜色的区域。</p></>}</div>}
+          {imageUrl && <div className="background-section"><label className="control-label">背景处理 <span>{backgroundMode === "keep" ? "保留" : backgroundMode === "ai" ? "AI 精准抠图" : backgroundMode === "transparent" ? "快速主体保护" : `替换为 ${backgroundCode}`}</span></label><div className="background-options"><button onClick={() => setBackgroundMode("keep")} className={backgroundMode === "keep" ? "selected" : ""}>保留</button><button onClick={() => setBackgroundMode("transparent")} className={backgroundMode === "transparent" ? "selected" : ""}>快速删除</button><button onClick={() => setBackgroundMode("ai")} className={backgroundMode === "ai" ? "selected ai-selected" : ""}>AI 精准</button><button onClick={() => setBackgroundMode("colour")} className={backgroundMode === "colour" ? "selected" : ""}>指定色号</button></div>{backgroundMode === "ai" ? <div className="ai-removal-note" role="status"><strong>AI 人像分割</strong><span>{aiStatus || "识别人物、头发和衣物轮廓；首次使用会下载模型，图片不会上传。"}</span></div> : backgroundMode !== "keep" && <><label className="crop-slider"><span>主体保护</span><output>{subjectProtection}%</output><input type="range" min="0" max="100" value={subjectProtection} onChange={(event) => setSubjectProtection(Number(event.target.value))} aria-label="主体保护强度，数值越高越不容易擦到人物" /></label><label className="crop-slider"><span>识别范围</span><output>{backgroundTolerance}</output><input type="range" min="8" max="55" value={backgroundTolerance} onChange={(event) => setBackgroundTolerance(Number(event.target.value))} aria-label="背景识别范围，数值越高删除越多" /></label>{backgroundMode === "colour" && <label className="background-colour"><span>背景色号</span><select value={backgroundCode} onChange={(event) => setBackgroundCode(event.target.value)}>{PALETTE.map((bead) => <option key={bead.code} value={bead.code}>{bead.code} · {bead.name}</option>)}</select></label>}<p>快速模式从画面边缘开始保守识别，并保护中央主体。人物仍被擦到时提高“主体保护”；背景残留时再提高“识别范围”。</p></>}</div>}
+          {aiError && <p className="ai-removal-error" role="alert">{aiError}</p>}
 
           <div className="notice"><span>i</span><p>已使用 MARD 221 色号：A26、B32、C29、D26、E24、F25、G21、H23、M15。图片仅在本地处理。</p></div>
           {lockedCodes.length > maxColors && <p className="lock-warning">已锁定 {lockedCodes.length} 色，会超过当前颜色上限。</p>}
-          <button className="generate-button" onClick={generate} disabled={!imageUrl}><ToolIcon name="sparkle" /> {requiresRegeneration ? "按新设置重新生成" : "生成拼豆图纸"}</button>
+          <button className="generate-button" onClick={generate} disabled={!imageUrl || isGenerating}><ToolIcon name="sparkle" /> {isGenerating ? (backgroundMode === "ai" ? "AI 正在识别主体…" : "正在生成图纸…") : requiresRegeneration ? "按新设置重新生成" : "生成拼豆图纸"}</button>
           {cells.length > 0 && <button className="sidebar-export" onClick={exportPng}><span>导出我的作品</span><ToolIcon name="arrow" /></button>}
         </aside>
 
