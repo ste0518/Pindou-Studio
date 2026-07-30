@@ -162,6 +162,28 @@ function connectedBackgroundMask(data: Uint8ClampedArray, width: number, height:
 
 type IconName = "upload" | "brush" | "eraser" | "eyedropper" | "undo" | "redo" | "sparkle" | "arrow";
 
+type TemplateCategory = "全部" | "人物" | "动物" | "植物" | "日常";
+type BeadTemplate = {
+  id: string;
+  category: Exclude<TemplateCategory, "全部">;
+  name: string;
+  description: string;
+  detail: number;
+  colours: number;
+  difficulty: string;
+  duration: string;
+  seed: number;
+};
+
+const BEAD_TEMPLATES: BeadTemplate[] = [
+  { id: "pet-portrait", category: "动物", name: "毛茸茸肖像", description: "适合猫狗正面照，保留眼神与毛色层次。", detail: 56, colours: 24, difficulty: "入门", duration: "约 2 小时", seed: 7 },
+  { id: "flower-postcard", category: "植物", name: "花园明信片", description: "把一束花或绿植做成明亮的小尺寸装饰。", detail: 48, colours: 24, difficulty: "入门", duration: "约 1.5 小时", seed: 21 },
+  { id: "portrait-frame", category: "人物", name: "人像纪念框", description: "适合半身照，推荐先用背景处理突出主体。", detail: 72, colours: 36, difficulty: "进阶", duration: "约 4 小时", seed: 43 },
+  { id: "food-icon", category: "日常", name: "美食小图标", description: "甜点、咖啡与餐盘照片都能做成可爱摆件。", detail: 40, colours: 12, difficulty: "入门", duration: "约 1 小时", seed: 61 },
+  { id: "wildlife-poster", category: "动物", name: "自然观察卡", description: "适合轮廓清楚的鸟类、昆虫或小动物照片。", detail: 80, colours: 36, difficulty: "进阶", duration: "约 5 小时", seed: 83 },
+  { id: "travel-memory", category: "日常", name: "旅行记忆卡", description: "将地标、街景和旅行合照制作成收藏图纸。", detail: 64, colours: 36, difficulty: "进阶", duration: "约 3 小时", seed: 101 },
+];
+
 function ToolIcon({ name }: { name: IconName }) {
   const shapes: Record<IconName, ReactNode> = {
     upload: <><path d="M12 15V3m0 0-4 4m4-4 4 4" /><path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" /></>,
@@ -213,11 +235,15 @@ export default function Home() {
   const [jumpRow, setJumpRow] = useState(1);
   const [jumpColumn, setJumpColumn] = useState(1);
   const [isDragging, setIsDragging] = useState(false);
+  const [templateFilter, setTemplateFilter] = useState<TemplateCategory>("全部");
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const cellsRef = useRef<Cell[]>([]);
   const isPainting = useRef(false);
   const aiSegmenter = useRef<BackgroundSegmenter | null>(null);
+  const selectedTemplate = BEAD_TEMPLATES.find((template) => template.id === selectedTemplateId);
+  const filteredTemplates = templateFilter === "全部" ? BEAD_TEMPLATES : BEAD_TEMPLATES.filter((template) => template.category === templateFilter);
 
   const counts = useMemo(() => {
     const map = new Map<string, { bead: Bead; count: number }>();
@@ -277,7 +303,7 @@ export default function Home() {
         if (imageUrl) URL.revokeObjectURL(imageUrl);
         setSourceAspect(nextSourceAspect);
         setExifOrientation(orientation);
-        applyDetail(DEFAULT_DETAIL, nextSourceAspect, 0);
+        applyDetail(selectedTemplate?.detail ?? DEFAULT_DETAIL, nextSourceAspect, 0);
         setImageUrl(url);
         cellsRef.current = [];
         setCells([]);
@@ -290,8 +316,8 @@ export default function Home() {
         setAiStatus("");
         setAiError("");
         setGeneratedSignature("");
-        setGeneratedColumns(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).columns);
-        setGeneratedRows(dimensionsForAspect(nextSourceAspect, DEFAULT_DETAIL).rows);
+        setGeneratedColumns(dimensionsForAspect(nextSourceAspect, selectedTemplate?.detail ?? DEFAULT_DETAIL).columns);
+        setGeneratedRows(dimensionsForAspect(nextSourceAspect, selectedTemplate?.detail ?? DEFAULT_DETAIL).rows);
         setActiveView("source");
         setIsLanding(false);
         window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
@@ -304,6 +330,14 @@ export default function Home() {
   const selectFile = (event: ChangeEvent<HTMLInputElement>) => {
     handleFile(event.target.files?.[0]);
     event.target.value = "";
+  };
+
+  const startFromTemplate = (template: BeadTemplate) => {
+    setSelectedTemplateId(template.id);
+    setProjectName(template.name);
+    setMaxColors(template.colours);
+    setDetail(template.detail);
+    fileInput.current?.click();
   };
 
   const commitCells = (next: Cell[]) => {
@@ -689,38 +723,53 @@ export default function Home() {
   return (
     <main className="app-shell" id="top">
       <header className="topbar">
-        <button className="brand" onClick={goToLanding} aria-label="返回拼豆工坊首页"><span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /><i /><i /><b>拼</b></span><span className="brand-copy"><strong>拼豆工坊</strong><small>AI 拼豆艺术创作平台</small></span></button>
-        <nav className="main-nav" aria-label="主导航">{isLanding ? <><a className="active" href="#hero-upload">创作空间</a><a href="#how-it-works">创作流程</a><a href="#inspiration">灵感画廊</a><a href="#inspiration">作品模板</a><a href="#colour-system">色彩体系</a></> : <><a className="active" href="#workspace">创作空间</a><a href="#materials">色彩体系</a></>}</nav>
+        <button className="brand" onClick={goToLanding} aria-label="返回拼豆工坊首页"><span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /><i /><i /><b>拼</b></span><span className="brand-copy"><strong>拼豆工坊</strong><small>本地拼豆图纸工作台</small></span></button>
+        <nav className="main-nav" aria-label="主导航">{isLanding ? <><a className="active" href="#hero-upload">创作空间</a><a href="#how-it-works">创作流程</a><a href="#inspiration-gallery">灵感画廊</a><a href="#template-market">作品模板</a><a href="#colour-system">色彩体系</a></> : <><a className="active" href="#workspace">创作空间</a><a href="#materials">色彩体系</a></>}</nav>
         {isLanding ? <div className="top-actions landing-actions"><button className="nav-cta" onClick={() => fileInput.current?.click()}>开启创作旅程 <ToolIcon name="arrow" /></button></div> : <><div className="project-field"><span>项目名称</span><input value={projectName} onChange={(event) => setProjectName(event.target.value)} aria-label="项目名称" /></div><div className="top-actions"><button className="quiet-button" onClick={saveDraft}>{draftMessage || "保存草稿"}</button><button className="primary-button" onClick={exportPng} disabled={!cells.length}>{exportMessage || "导出 PNG 图纸"}</button></div></>}
       </header>
       <input ref={fileInput} className="global-file-input" type="file" accept="image/jpeg,image/png,image/webp" onChange={selectFile} />
 
-      {isLanding ? <section className="landing-page" aria-labelledby="landing-title">
+      {isLanding ? <><section className="landing-page" aria-labelledby="landing-title">
         <div className="landing-mesh" aria-hidden="true"><span /><span /><span /></div>
         <div className="landing-grid">
           <div className="landing-copy">
-            <p className="hero-kicker"><ToolIcon name="sparkle" /> AI POWERED BEAD STUDIO · 拼豆艺术创作空间</p>
+            <p className="hero-kicker"><ToolIcon name="sparkle" /> LOCAL BEAD STUDIO · 拼豆艺术创作空间</p>
             <h1 id="landing-title">让每一份<br />视觉灵感，<br /><em>成为独一无二的<br /><span>拼豆艺术作品</span>。</em></h1>
-            <p className="hero-description">从一张图片开始，AI 自动解析视觉元素，匹配 MARD 221 专业拼豆色彩体系，生成属于你的专属制作图纸。</p>
+            <p className="hero-description">从一张图片开始，在浏览器本地匹配 MARD 221 专业拼豆色彩体系，生成属于你的专属制作图纸。</p>
             <div className="hero-actions">
               <button className="hero-cta" onClick={() => fileInput.current?.click()}><ToolIcon name="sparkle" />开启创作旅程</button>
               <button className="hero-secondary" onClick={() => document.getElementById("inspiration")?.scrollIntoView({ behavior: "smooth" })}>探索灵感画廊 <ToolIcon name="arrow" /></button>
             </div>
             <div className="hero-note-row"><p className="hero-privacy">无需注册 · 所有图像仅在你的浏览器中私密处理</p>{cells.length > 0 && <button className="hero-draft-link" onClick={enterStudio}>继续我的创作 <ToolIcon name="arrow" /></button>}</div>
             <div className="hero-metrics" id="how-it-works">
-              <div><strong>221 种</strong><span>专业色彩体系</span></div><div><strong>AI 驱动</strong><span>智能生成流程</span></div><div><strong>高清导出</strong><span>施工图纸即刻呈现</span></div>
+              <div><strong>221 种</strong><span>专业色彩体系</span></div><div><strong>本地处理</strong><span>原图不离开设备</span></div><div><strong>高清导出</strong><span>施工图纸即刻呈现</span></div>
             </div>
           </div>
-          <div className="hero-visual" id="inspiration" aria-hidden="true">
-            <div className="visual-glow glow-one" /><div className="visual-glow glow-two" />
-            <div className="hero-preview-card"><div className="preview-card-top"><span>AI 创作预览</span><i>色彩已就绪</i></div><div className="mini-pattern">{Array.from({ length: 100 }, (_, index) => <i key={index} style={{ backgroundColor: PALETTE[(index * 13 + Math.floor(index / 10) * 7) % PALETTE.length].hex }} />)}</div><div className="preview-card-footer"><span><b />MARD 221 色彩体系</span><strong>98 × 112</strong></div></div>
+          <div className="hero-visual">
+            <div className="visual-glow glow-one" aria-hidden="true" /><div className="visual-glow glow-two" aria-hidden="true" />
+            <div className="hero-preview-card" aria-hidden="true"><div className="preview-card-top"><span>图纸创作预览</span><i>色彩已就绪</i></div><div className="mini-pattern">{Array.from({ length: 100 }, (_, index) => <i key={index} style={{ backgroundColor: PALETTE[(index * 13 + Math.floor(index / 10) * 7) % PALETTE.length].hex }} />)}</div><div className="preview-card-footer"><span><b />MARD 221 色彩体系</span><strong>98 × 112</strong></div></div>
             <div className="hero-palette-card" id="colour-system"><span><b /> MARD 221</span><strong>专业色彩体系</strong><small>每一种颜色，都有真实可制作的归属。</small><div>{PALETTE.slice(18, 30).map((bead) => <i key={bead.code} style={{ backgroundColor: bead.hex }} />)}</div></div>
-            <button id="hero-upload" className={`hero-upload-card ${isDragging ? "dragging" : ""}`} onClick={() => fileInput.current?.click()} onDragOver={(event: DragEvent) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(event: DragEvent) => { event.preventDefault(); setIsDragging(false); handleFile(event.dataTransfer.files[0]); }}><span className="upload-orbit"><ToolIcon name="upload" /></span><strong>开启你的第一件拼豆艺术</strong><small>导入图像 · 智能生成 · 进入专属工作台</small></button>
+            <button id="hero-upload" className={`hero-upload-card ${isDragging ? "dragging" : ""}`} onClick={() => fileInput.current?.click()} onDragOver={(event: DragEvent) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(event: DragEvent) => { event.preventDefault(); setIsDragging(false); handleFile(event.dataTransfer.files[0]); }}><span className="upload-orbit"><ToolIcon name="upload" /></span><strong>开启你的第一件拼豆艺术</strong><small>导入图像 · 匹配色号 · 进入专属工作台</small></button>
           </div>
         </div>
-      </section> : <section className={`workspace ${cells.length ? "has-pattern" : "awaiting-pattern"}`} id="workspace">
+      </section>
+
+      <section className="landing-discovery" aria-label="模板与灵感">
+        <section className="inspiration-gallery" id="inspiration-gallery" aria-labelledby="inspiration-title">
+          <div className="discovery-heading"><div><p className="eyebrow">灵感画廊</p><h2 id="inspiration-title">把日常收藏成<br />可完成的小作品</h2></div><p>从宠物、花草到旅行瞬间，先找一个适合的构图，再上传自己的照片开始制作。</p></div>
+          <div className="inspiration-grid">
+            {BEAD_TEMPLATES.slice(0, 4).map((template) => <article className={`inspiration-card inspiration-${template.category}`} key={template.id}><div className="inspiration-mosaic" aria-hidden="true">{Array.from({ length: 36 }, (_, index) => <i key={index} style={{ backgroundColor: PALETTE[(template.seed + index * 11 + Math.floor(index / 6) * 5) % PALETTE.length].hex }} />)}</div><div><span>{template.category}灵感</span><h3>{template.name}</h3><p>{template.description}</p></div></article>)}
+          </div>
+        </section>
+
+        <section className="template-market" id="template-market" aria-labelledby="template-title">
+          <div className="discovery-heading"><div><p className="eyebrow">模板市场</p><h2 id="template-title">从合适的规格开始，<br />第一次就更好拼</h2></div><p>模板会预设推荐的图纸细节和用色数；选择后上传自己的照片即可应用，所有处理仍在本地完成。</p></div>
+          <div className="template-filters" role="group" aria-label="筛选模板类别">{(["全部", "人物", "动物", "植物", "日常"] as TemplateCategory[]).map((category) => <button key={category} className={templateFilter === category ? "active" : ""} onClick={() => setTemplateFilter(category)} aria-pressed={templateFilter === category}>{category}</button>)}</div>
+          <div className="template-grid">{filteredTemplates.map((template) => <article className={`template-card ${selectedTemplateId === template.id ? "selected" : ""}`} key={template.id}><div className="template-mosaic" aria-hidden="true">{Array.from({ length: 64 }, (_, index) => <i key={index} style={{ backgroundColor: PALETTE[(template.seed + index * 9 + Math.floor(index / 8) * 13) % PALETTE.length].hex }} />)}</div><div className="template-meta"><span>{template.category}</span><span>{template.difficulty}</span></div><h3>{template.name}</h3><p>{template.description}</p><div className="template-details"><span>{template.detail} 格细节</span><span>{template.colours} 色</span><span>{template.duration}</span></div><button onClick={() => startFromTemplate(template)}>用此模板创作 <ToolIcon name="arrow" /></button></article>)}</div>
+        </section>
+      </section></> : <section className={`workspace ${cells.length ? "has-pattern" : "awaiting-pattern"}`} id="workspace">
         <aside className="settings-panel">
-          <div className="settings-intro"><span>AI BEAD ART STUDIO</span><h2>让图像成为<br />可以制作的作品</h2><p>你的专属拼豆设计工作室。全部处理都在浏览器本地完成。</p><div className="settings-capabilities"><span>AI 智能解析</span><span>MARD 221</span><span>精准网格</span></div></div>
+          <div className="settings-intro"><span>LOCAL BEAD ART STUDIO</span><h2>让图像成为<br />可以制作的作品</h2><p>你的专属拼豆设计工作室。全部处理都在浏览器本地完成。</p><div className="settings-capabilities"><span>本地色彩匹配</span><span>MARD 221</span><span>精准网格</span></div></div>
           {cells.length > 0 && <div className="studio-summary" aria-label="图纸摘要"><div><span>当前图纸</span><strong>{generatedColumns} × {generatedRows}</strong><small>{requiresRegeneration ? "设置待重新生成" : "已是最新尺寸"}</small></div><div><span>色彩系统</span><strong>MARD 221</strong><small>{counts.length} 色已匹配</small></div><div><span>制作统计</span><strong>{nonEmpty.toLocaleString()} 颗</strong><small>拼豆总数量</small></div><div><span>预计时长</span><strong>约 {estimatedMinutes} 分钟</strong><small>按当前图纸估算</small></div></div>}
           <div className="section-heading"><span>图纸设置</span></div>
           <div
