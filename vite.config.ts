@@ -54,6 +54,9 @@ export default defineConfig(async () => {
       vinext(),
       sites(),
       cloudflare({
+        // The inspector is useful for worker debugging, but it is not required for this
+        // static client editor and can prevent local previews in restricted environments.
+        inspectorPort: false,
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
         config: localBindingConfig,
       }),

@@ -2,8 +2,6 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const templateRoot = new URL("../", import.meta.url);
-
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
@@ -24,7 +22,7 @@ test("server-renders the local bead studio landing page", async () => {
   const html = await response.text();
   assert.match(html, /<title>拼豆工坊｜拼豆图纸生成工具<\/title>/);
   assert.match(html, /LOCAL BEAD STUDIO/);
-  assert.match(html, /所有图像仅在你的浏览器中私密处理/);
+  assert.match(html, /图片始终留在你的设备上处理/);
   assert.match(html, /灵感画廊/);
   assert.match(html, /模板市场/);
   assert.match(html, /用此模板创作/);
@@ -41,6 +39,9 @@ test("keeps template selection local to the image-to-pattern workflow", async ()
   assert.match(page, /const startFromTemplate/);
   assert.match(page, /setMaxColors\(template\.colours\)/);
   assert.match(page, /setDetail\(template\.detail\)/);
+  assert.match(page, /AI 人像分割/);
+  assert.match(page, /sharpenTransparency/);
+  assert.doesNotMatch(page, /coverage < 0\.025 \|\| coverage > 0\.98/);
   assert.doesNotMatch(page, /动漫风|图生图|style-transfer/i);
   assert.doesNotMatch(page, /https?:\/\/api\./i);
 });

@@ -1,6 +1,7 @@
 "use client";
+/* eslint-disable @next/next/no-img-element -- The source preview uses a local Blob URL, which the image optimizer cannot load. */
 
-import { ChangeEvent, DragEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Bead, MARD_221_PALETTE, rgbToOklab } from "./palette";
 
 type Cell = Bead | null;
@@ -13,6 +14,7 @@ const DRAFT_KEY = "pindou-workshop-draft-v1";
 const MIN_GRID_SIDE = 8;
 const MAX_GRID_SIDE = 160;
 const DEFAULT_DETAIL = 64;
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const paletteOrder = (code: string) => PALETTE.findIndex((bead) => bead.code === code);
 
 function dimensionsForAspect(aspect: number, longSide: number) {
@@ -160,6 +162,30 @@ function connectedBackgroundMask(data: Uint8ClampedArray, width: number, height:
   return mask;
 }
 
+function alphaCoverage(canvas: HTMLCanvasElement, threshold = 96) {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return 1;
+  const alpha = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  let visible = 0;
+  for (let index = 3; index < alpha.length; index += 4) {
+    if (alpha[index] >= threshold) visible += 1;
+  }
+  return visible / (canvas.width * canvas.height);
+}
+
+function sharpenTransparency(canvas: HTMLCanvasElement, low = 72, high = 184) {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return;
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  for (let index = 3; index < imageData.data.length; index += 4) {
+    const alpha = imageData.data[index];
+    if (alpha <= low) imageData.data[index] = 0;
+    else if (alpha >= high) imageData.data[index] = 255;
+    else imageData.data[index] = Math.round(((alpha - low) / (high - low)) * 255);
+  }
+  context.putImageData(imageData, 0, 0);
+}
+
 type IconName = "upload" | "brush" | "eraser" | "eyedropper" | "undo" | "redo" | "sparkle" | "arrow";
 
 type TemplateCategory = "全部" | "人物" | "动物" | "植物" | "日常";
@@ -214,6 +240,7 @@ export default function Home() {
   const [tool, setTool] = useState<EditorTool>("brush");
   const [selectedCode, setSelectedCode] = useState("A1");
   const [exportMessage, setExportMessage] = useState("");
+  const [isExporting, setIsExporting] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [cropZoom, setCropZoom] = useState(100);
   const [cropOffsetX, setCropOffsetX] = useState(0);
@@ -237,11 +264,15 @@ export default function Home() {
   const [isDragging, setIsDragging] = useState(false);
   const [templateFilter, setTemplateFilter] = useState<TemplateCategory>("全部");
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState("");
+  const [focusedCell, setFocusedCell] = useState(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const cellsRef = useRef<Cell[]>([]);
   const isPainting = useRef(false);
   const aiSegmenter = useRef<BackgroundSegmenter | null>(null);
+  const draftMessageTimer = useRef<number | undefined>(undefined);
+  const exportMessageTimer = useRef<number | undefined>(undefined);
   const selectedTemplate = BEAD_TEMPLATES.find((template) => template.id === selectedTemplateId);
   const filteredTemplates = templateFilter === "全部" ? BEAD_TEMPLATES : BEAD_TEMPLATES.filter((template) => template.category === templateFilter);
 
@@ -287,12 +318,32 @@ export default function Home() {
     const outputContext = output.getContext("2d");
     if (!outputContext) throw new Error("无法创建 AI 图像画布");
     outputContext.putImageData(new ImageData(new Uint8ClampedArray(result.data), result.width, result.height), 0, 0);
-    setAiStatus("AI 精准抠图完成");
     return output;
   };
 
+  const showDraftMessage = (message: string) => {
+    if (draftMessageTimer.current) window.clearTimeout(draftMessageTimer.current);
+    setDraftMessage(message);
+    if (message) draftMessageTimer.current = window.setTimeout(() => setDraftMessage(""), 3500);
+  };
+
+  const showExportMessage = (message: string) => {
+    if (exportMessageTimer.current) window.clearTimeout(exportMessageTimer.current);
+    setExportMessage(message);
+    if (message) exportMessageTimer.current = window.setTimeout(() => setExportMessage(""), 3500);
+  };
+
   const handleFile = (file?: File) => {
-    if (!file || !file.type.startsWith("image/")) return;
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setUploadError("请选择 JPG、PNG 或 WebP 图片。");
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      setUploadError("图片超过 15 MB，请压缩后再试。");
+      return;
+    }
+    if (cellsRef.current.length && !window.confirm("更换图片会清空当前图纸和未保存的编辑。是否继续？")) return;
     void (async () => {
       const orientation = await readExifOrientation(file);
       const url = URL.createObjectURL(file);
@@ -315,6 +366,8 @@ export default function Home() {
         setCropOffsetY(0);
         setAiStatus("");
         setAiError("");
+        setUploadError("");
+        showDraftMessage("");
         setGeneratedSignature("");
         setGeneratedColumns(dimensionsForAspect(nextSourceAspect, selectedTemplate?.detail ?? DEFAULT_DETAIL).columns);
         setGeneratedRows(dimensionsForAspect(nextSourceAspect, selectedTemplate?.detail ?? DEFAULT_DETAIL).rows);
@@ -322,7 +375,10 @@ export default function Home() {
         setIsLanding(false);
         window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: "smooth" }));
       };
-      image.onerror = () => URL.revokeObjectURL(url);
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        setUploadError("这张图片无法读取，请换一张 JPG、PNG 或 WebP 图片。");
+      };
       image.src = url;
     })();
   };
@@ -386,11 +442,10 @@ export default function Home() {
   };
 
   const saveDraft = () => {
-    if (!cells.length) { setDraftMessage("请先生成图纸"); return; }
+    if (!cells.length) { showDraftMessage("请先生成图纸"); return; }
     const draft = { projectName, columns, rows, detail, sourceAspect, generatedColumns, generatedRows, maxColors, rotation, cropZoom, cropOffsetX, cropOffsetY, backgroundMode, backgroundCode, backgroundTolerance, subjectProtection, lockedCodes, cells: cells.map((bead) => bead?.code ?? null), generatedSignature };
     window.localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
-    setDraftMessage("草稿已保存在本机");
-    window.setTimeout(() => setDraftMessage(""), 2500);
+    showDraftMessage("草稿已保存在本机");
   };
 
   const jumpToGrid = () => {
@@ -404,6 +459,8 @@ export default function Home() {
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z") return;
+      const target = event.target as HTMLElement | null;
+      if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
       event.preventDefault();
       if (event.shiftKey) redo(); else undo();
     };
@@ -421,9 +478,7 @@ export default function Home() {
         if (!restoredCells.length) return;
         let restoredGeneratedColumns = draft.generatedColumns ?? draft.columns;
         let restoredGeneratedRows = draft.generatedRows ?? draft.rows;
-        let recoveredDimensions = false;
         if (restoredGeneratedColumns * restoredGeneratedRows !== restoredCells.length) {
-          recoveredDimensions = true;
           const squareSide = Math.sqrt(restoredCells.length);
           if (Number.isInteger(squareSide)) {
             restoredGeneratedColumns = squareSide;
@@ -433,10 +488,10 @@ export default function Home() {
             restoredGeneratedRows = draft.rows;
           }
         }
-        const recoveredSignature = JSON.stringify({ columns: restoredGeneratedColumns, rows: restoredGeneratedRows, maxColors: draft.maxColors, rotation: draft.rotation, cropZoom: draft.cropZoom, cropOffsetX: draft.cropOffsetX, cropOffsetY: draft.cropOffsetY, backgroundMode: draft.backgroundMode, backgroundCode: draft.backgroundCode, backgroundTolerance: draft.backgroundTolerance, subjectProtection: draft.subjectProtection ?? 68, lockedCodes: [...draft.lockedCodes].sort() });
-        const legacyDraft = draft.generatedColumns === undefined || draft.generatedRows === undefined || draft.subjectProtection === undefined;
-        const restoredSignature = recoveredDimensions || legacyDraft ? recoveredSignature : draft.generatedSignature ?? recoveredSignature;
-        setProjectName(draft.projectName); setColumns(draft.columns); setRows(draft.rows); setDetail(draft.detail ?? Math.max(draft.columns, draft.rows)); setSourceAspect(draft.sourceAspect ?? draft.columns / draft.rows); setGeneratedColumns(restoredGeneratedColumns); setGeneratedRows(restoredGeneratedRows); setMaxColors(draft.maxColors); setRotation(draft.rotation); setCropZoom(draft.cropZoom); setCropOffsetX(draft.cropOffsetX); setCropOffsetY(draft.cropOffsetY); setBackgroundMode(draft.backgroundMode); setBackgroundCode(draft.backgroundCode); setBackgroundTolerance(draft.backgroundTolerance); setSubjectProtection(draft.subjectProtection ?? 68); setLockedCodes(draft.lockedCodes); cellsRef.current = restoredCells; setCells(restoredCells); setGeneratedSignature(restoredSignature); setDraftMessage("已恢复本机草稿；原图不会保留"); setIsLanding(false);
+        // A recovered draft has no source image. Show the exact saved drawing as the current
+        // state instead of presenting a disabled "regenerate" action with mismatched settings.
+        const restoredSignature = JSON.stringify({ columns: restoredGeneratedColumns, rows: restoredGeneratedRows, maxColors: draft.maxColors, rotation: 0, cropZoom: 100, cropOffsetX: 0, cropOffsetY: 0, backgroundMode: draft.backgroundMode, backgroundCode: draft.backgroundCode, backgroundTolerance: draft.backgroundTolerance, subjectProtection: draft.subjectProtection ?? 68, lockedCodes: [...draft.lockedCodes].sort() });
+        setProjectName(draft.projectName); setColumns(restoredGeneratedColumns); setRows(restoredGeneratedRows); setDetail(Math.max(restoredGeneratedColumns, restoredGeneratedRows)); setSourceAspect(restoredGeneratedColumns / restoredGeneratedRows); setGeneratedColumns(restoredGeneratedColumns); setGeneratedRows(restoredGeneratedRows); setMaxColors(draft.maxColors); setRotation(0); setCropZoom(100); setCropOffsetX(0); setCropOffsetY(0); setBackgroundMode(draft.backgroundMode); setBackgroundCode(draft.backgroundCode); setBackgroundTolerance(draft.backgroundTolerance); setSubjectProtection(draft.subjectProtection ?? 68); setLockedCodes(draft.lockedCodes); cellsRef.current = restoredCells; setCells(restoredCells); setGeneratedSignature(restoredSignature); showDraftMessage("已恢复本机草稿；请重新上传原图后再改图纸设置。"); setIsLanding(false);
       } catch { window.localStorage.removeItem(DRAFT_KEY); }
     }, 0);
     return () => window.clearTimeout(restoreTimer);
@@ -444,6 +499,7 @@ export default function Home() {
 
   const generate = () => {
     if (!imageUrl || isGenerating) return;
+    if (history.length && !window.confirm("重新生成会覆盖你手动修改过的格子。是否继续？")) return;
     setIsGenerating(true);
     setAiError("");
     const image = new Image();
@@ -482,7 +538,7 @@ export default function Home() {
       if (backgroundMode !== "keep") {
         // Detect the background before reducing the image to a small bead grid.
         // At this resolution, a subject edge has enough information to act as a barrier.
-        const analysisScale = Math.max(4, Math.min(8, Math.floor(640 / Math.max(columns, rows)) || 4));
+        const analysisScale = Math.max(4, Math.min(10, Math.floor(800 / Math.max(columns, rows)) || 4));
         const analysisWidth = columns * analysisScale;
         const analysisHeight = rows * analysisScale;
         const analysisCanvas = document.createElement("canvas");
@@ -494,10 +550,21 @@ export default function Home() {
         if (backgroundMode === "ai") {
           try {
             const aiOutput = await removeBackgroundWithAI(analysisCanvas);
-            analysisContext.clearRect(0, 0, analysisWidth, analysisHeight);
-            analysisContext.drawImage(aiOutput, 0, 0, analysisWidth, analysisHeight);
+            const coverage = alphaCoverage(aiOutput);
+            // Close-up portraits can legitimately fill almost the whole frame, so only reject
+            // truly empty or unchanged masks. This avoids silently discarding good results.
+            if (coverage < 0.005 || coverage > 0.995) {
+              setAiError("AI 没有识别出可分离的背景，已保留原图。请换用背景更清楚的人像，或使用“快速删除”。");
+              setAiStatus("AI 结果不适用，已保留原图");
+            } else {
+              sharpenTransparency(aiOutput);
+              setAiStatus(`AI 人像分割完成 · 保留主体约 ${Math.round(alphaCoverage(aiOutput) * 100)}%`);
+              analysisContext.clearRect(0, 0, analysisWidth, analysisHeight);
+              analysisContext.drawImage(aiOutput, 0, 0, analysisWidth, analysisHeight);
+            }
           } catch (error) {
-            setAiError("AI 抠图暂时不可用，已改用主体保护模式。请检查网络后重试。");
+            setAiError("AI 人像分割暂时不可用，已改用“快速删除”（非 AI）生成图纸。请检查网络后重试。");
+            setAiStatus("AI 未成功加载 · 当前使用快速删除");
             const analysisImageData = analysisContext.getImageData(0, 0, analysisWidth, analysisHeight);
             const analysisData = analysisImageData.data;
             const backgroundMask = connectedBackgroundMask(analysisData, analysisWidth, analysisHeight, backgroundTolerance / 500, subjectProtection);
@@ -588,6 +655,20 @@ export default function Home() {
     window.requestAnimationFrame(() => stageRef.current?.scrollTo({ top: 0, left: 0, behavior: "smooth" }));
   };
 
+  const moveGridFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index;
+    if (event.key === "ArrowLeft") nextIndex = Math.max(0, index - 1);
+    else if (event.key === "ArrowRight") nextIndex = Math.min(cells.length - 1, index + 1);
+    else if (event.key === "ArrowUp") nextIndex = Math.max(0, index - generatedColumns);
+    else if (event.key === "ArrowDown") nextIndex = Math.min(cells.length - 1, index + generatedColumns);
+    else if (event.key === "Home") nextIndex = Math.floor(index / generatedColumns) * generatedColumns;
+    else if (event.key === "End") nextIndex = Math.min(cells.length - 1, Math.floor(index / generatedColumns) * generatedColumns + generatedColumns - 1);
+    else return;
+    event.preventDefault();
+    setFocusedCell(nextIndex);
+    window.requestAnimationFrame(() => document.getElementById(`bead-cell-${nextIndex}`)?.focus());
+  };
+
   const goToLanding = () => {
     setIsLanding(true);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -599,7 +680,9 @@ export default function Home() {
   };
 
   const exportPng = () => {
-    if (!cells.length) return;
+    if (!cells.length || isExporting) return;
+    setIsExporting(true);
+    showExportMessage("正在准备 PNG…");
     const cellSize = Math.max(20, Math.min(42, Math.floor(3200 / Math.max(generatedColumns, generatedRows))));
     const pagePadding = 90;
     const rulerSize = 48;
@@ -615,7 +698,11 @@ export default function Home() {
     canvas.width = outputWidth;
     canvas.height = outputHeight;
     const context = canvas.getContext("2d");
-    if (!context) return;
+    if (!context) {
+      setIsExporting(false);
+      showExportMessage("无法创建 PNG，请刷新后重试。");
+      return;
+    }
 
     const gridX = pagePadding + rulerSize;
     const gridY = headerHeight + rulerSize;
@@ -708,15 +795,23 @@ export default function Home() {
     drawText("MARD 221", outputWidth - pagePadding, outputHeight - 29, "700 12px Arial", "#747976", "right");
 
     canvas.toBlob((blob) => {
-      if (!blob) return;
+      if (!blob) {
+        setIsExporting(false);
+        showExportMessage("PNG 生成失败，请减少图纸尺寸后重试。");
+        return;
+      }
       const link = document.createElement("a");
       const safeName = (projectName || "拼豆图纸").replace(/[\\/:*?\"<>|]/g, "-");
-      link.href = URL.createObjectURL(blob);
+      const objectUrl = URL.createObjectURL(blob);
+      link.href = objectUrl;
       link.download = `${safeName}-${generatedColumns}x${generatedRows}-MARD221.png`;
+      link.style.display = "none";
+      document.body.appendChild(link);
       link.click();
-      URL.revokeObjectURL(link.href);
-      setExportMessage("PNG 已下载");
-      window.setTimeout(() => setExportMessage(""), 2500);
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      setIsExporting(false);
+      showExportMessage("PNG 已开始下载");
     }, "image/png");
   };
 
@@ -724,23 +819,24 @@ export default function Home() {
     <main className="app-shell" id="top">
       <header className="topbar">
         <button className="brand" onClick={goToLanding} aria-label="返回拼豆工坊首页"><span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /><i /><i /><b>拼</b></span><span className="brand-copy"><strong>拼豆工坊</strong><small>本地拼豆图纸工作台</small></span></button>
-        <nav className="main-nav" aria-label="主导航">{isLanding ? <><a className="active" href="#hero-upload">创作空间</a><a href="#how-it-works">创作流程</a><a href="#inspiration-gallery">灵感画廊</a><a href="#template-market">作品模板</a><a href="#colour-system">色彩体系</a></> : <><a className="active" href="#workspace">创作空间</a><a href="#materials">色彩体系</a></>}</nav>
-        {isLanding ? <div className="top-actions landing-actions"><button className="nav-cta" onClick={() => fileInput.current?.click()}>开启创作旅程 <ToolIcon name="arrow" /></button></div> : <><div className="project-field"><span>项目名称</span><input value={projectName} onChange={(event) => setProjectName(event.target.value)} aria-label="项目名称" /></div><div className="top-actions"><button className="quiet-button" onClick={saveDraft}>{draftMessage || "保存草稿"}</button><button className="primary-button" onClick={exportPng} disabled={!cells.length}>{exportMessage || "导出 PNG 图纸"}</button></div></>}
+        <nav className="main-nav" aria-label="主导航">{isLanding ? <><a className="active" href="#hero-upload">开始创作</a><a href="#inspiration-gallery">灵感</a><a href="#template-market">模板</a><a href="#colour-system">色卡</a></> : <><a className="active" href="#workspace">工作台</a><a href="#materials">用量清单</a></>}</nav>
+        {isLanding ? <div className="top-actions landing-actions"><button className="nav-cta" onClick={() => fileInput.current?.click()}>上传图片 <ToolIcon name="arrow" /></button></div> : <><div className="project-field"><span>项目名称</span><input value={projectName} onChange={(event) => setProjectName(event.target.value)} aria-label="项目名称" /></div><div className="top-actions"><button className="quiet-button" onClick={saveDraft} aria-live="polite">{draftMessage || "保存草稿"}</button><button className="primary-button" onClick={exportPng} disabled={!cells.length || isExporting} aria-live="polite">{exportMessage || "导出 PNG"}</button></div></>}
       </header>
       <input ref={fileInput} className="global-file-input" type="file" accept="image/jpeg,image/png,image/webp" onChange={selectFile} />
+      {uploadError && <p className="upload-error" role="alert">{uploadError}</p>}
 
       {isLanding ? <><section className="landing-page" aria-labelledby="landing-title">
         <div className="landing-mesh" aria-hidden="true"><span /><span /><span /></div>
         <div className="landing-grid">
           <div className="landing-copy">
-            <p className="hero-kicker"><ToolIcon name="sparkle" /> LOCAL BEAD STUDIO · 拼豆艺术创作空间</p>
-            <h1 id="landing-title">让每一份<br />视觉灵感，<br /><em>成为独一无二的<br /><span>拼豆艺术作品</span>。</em></h1>
-            <p className="hero-description">从一张图片开始，在浏览器本地匹配 MARD 221 专业拼豆色彩体系，生成属于你的专属制作图纸。</p>
+            <p className="hero-kicker"><ToolIcon name="sparkle" /> LOCAL BEAD STUDIO · 拼豆图纸生成器</p>
+            <h1 id="landing-title">把照片变成<br /><em>可制作的<span>拼豆图纸</span></em></h1>
+            <p className="hero-description">上传一张图片，匹配 MARD 221 色号，得到可编辑、可导出的拼豆施工图。</p>
             <div className="hero-actions">
-              <button className="hero-cta" onClick={() => fileInput.current?.click()}><ToolIcon name="sparkle" />开启创作旅程</button>
-              <button className="hero-secondary" onClick={() => document.getElementById("inspiration")?.scrollIntoView({ behavior: "smooth" })}>探索灵感画廊 <ToolIcon name="arrow" /></button>
+              <button className="hero-cta" onClick={() => fileInput.current?.click()}><ToolIcon name="upload" />上传图片</button>
+              <button className="hero-secondary" onClick={() => document.getElementById("inspiration-gallery")?.scrollIntoView({ behavior: "smooth" })}>浏览创作灵感 <ToolIcon name="arrow" /></button>
             </div>
-            <div className="hero-note-row"><p className="hero-privacy">无需注册 · 所有图像仅在你的浏览器中私密处理</p>{cells.length > 0 && <button className="hero-draft-link" onClick={enterStudio}>继续我的创作 <ToolIcon name="arrow" /></button>}</div>
+            <div className="hero-note-row"><p className="hero-privacy">无需注册，图片始终留在你的设备上处理</p>{cells.length > 0 && <button className="hero-draft-link" onClick={enterStudio}>继续编辑草稿 <ToolIcon name="arrow" /></button>}</div>
             <div className="hero-metrics" id="how-it-works">
               <div><strong>221 种</strong><span>专业色彩体系</span></div><div><strong>本地处理</strong><span>原图不离开设备</span></div><div><strong>高清导出</strong><span>施工图纸即刻呈现</span></div>
             </div>
@@ -749,7 +845,7 @@ export default function Home() {
             <div className="visual-glow glow-one" aria-hidden="true" /><div className="visual-glow glow-two" aria-hidden="true" />
             <div className="hero-preview-card" aria-hidden="true"><div className="preview-card-top"><span>图纸创作预览</span><i>色彩已就绪</i></div><div className="mini-pattern">{Array.from({ length: 100 }, (_, index) => <i key={index} style={{ backgroundColor: PALETTE[(index * 13 + Math.floor(index / 10) * 7) % PALETTE.length].hex }} />)}</div><div className="preview-card-footer"><span><b />MARD 221 色彩体系</span><strong>98 × 112</strong></div></div>
             <div className="hero-palette-card" id="colour-system"><span><b /> MARD 221</span><strong>专业色彩体系</strong><small>每一种颜色，都有真实可制作的归属。</small><div>{PALETTE.slice(18, 30).map((bead) => <i key={bead.code} style={{ backgroundColor: bead.hex }} />)}</div></div>
-            <button id="hero-upload" className={`hero-upload-card ${isDragging ? "dragging" : ""}`} onClick={() => fileInput.current?.click()} onDragOver={(event: DragEvent) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(event: DragEvent) => { event.preventDefault(); setIsDragging(false); handleFile(event.dataTransfer.files[0]); }}><span className="upload-orbit"><ToolIcon name="upload" /></span><strong>开启你的第一件拼豆艺术</strong><small>导入图像 · 匹配色号 · 进入专属工作台</small></button>
+            <button id="hero-upload" className={`hero-upload-card ${isDragging ? "dragging" : ""}`} onClick={() => fileInput.current?.click()} onDragOver={(event: DragEvent) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(event: DragEvent) => { event.preventDefault(); setIsDragging(false); handleFile(event.dataTransfer.files[0]); }}><span className="upload-orbit"><ToolIcon name="upload" /></span><strong>上传一张参考图片</strong><small>上传 · 调整 · 生成图纸</small></button>
           </div>
         </div>
       </section>
@@ -769,7 +865,7 @@ export default function Home() {
         </section>
       </section></> : <section className={`workspace ${cells.length ? "has-pattern" : "awaiting-pattern"}`} id="workspace">
         <aside className="settings-panel">
-          <div className="settings-intro"><span>LOCAL BEAD ART STUDIO</span><h2>让图像成为<br />可以制作的作品</h2><p>你的专属拼豆设计工作室。全部处理都在浏览器本地完成。</p><div className="settings-capabilities"><span>本地色彩匹配</span><span>MARD 221</span><span>精准网格</span></div></div>
+          <div className="settings-intro"><span>第 2 步 · 设置图纸</span><h2>先确定规格，<br />再生成图纸</h2><p>图像和图纸都只在浏览器本地处理。</p><div className="settings-capabilities"><span>本地色彩匹配</span><span>MARD 221</span><span>精准网格</span></div></div>
           {cells.length > 0 && <div className="studio-summary" aria-label="图纸摘要"><div><span>当前图纸</span><strong>{generatedColumns} × {generatedRows}</strong><small>{requiresRegeneration ? "设置待重新生成" : "已是最新尺寸"}</small></div><div><span>色彩系统</span><strong>MARD 221</strong><small>{counts.length} 色已匹配</small></div><div><span>制作统计</span><strong>{nonEmpty.toLocaleString()} 颗</strong><small>拼豆总数量</small></div><div><span>预计时长</span><strong>约 {estimatedMinutes} 分钟</strong><small>按当前图纸估算</small></div></div>}
           <div className="section-heading"><span>图纸设置</span></div>
           <div
@@ -780,7 +876,7 @@ export default function Home() {
             onDrop={(event: DragEvent) => { event.preventDefault(); setIsDragging(false); handleFile(event.dataTransfer.files[0]); }}
             role="button"
             tabIndex={0}
-            onKeyDown={(event) => event.key === "Enter" && fileInput.current?.click()}
+            onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); fileInput.current?.click(); } }}
           >
             <ToolIcon name="upload" /><strong>{imageUrl ? "更换图片" : "上传参考图片"}</strong><span>JPG、PNG、WebP · 本地处理</span>
           </div>
@@ -798,15 +894,19 @@ export default function Home() {
           <label className="control-label">最多使用颜色 <span>{maxColors} 色</span></label>
           <div className="colour-options">{[12, 24, 36, 60, 221].map((number) => <button key={number} onClick={() => setMaxColors(number)} className={maxColors === number ? "selected" : ""}>{number === 221 ? "完整" : number}</button>)}</div>
 
-          {imageUrl && <div className="crop-section"><label className="control-label">裁剪与旋转 <span>实时预览</span></label><div className="rotation-row"><button onClick={() => setRotation((value) => { const next = (value + 270) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向左旋转 90 度">↶ 向左</button><span>{rotation === 0 ? "原始方向" : `已旋转 ${rotation}°`}</span><button onClick={() => setRotation((value) => { const next = (value + 90) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向右旋转 90 度">向右 ↷</button></div><label className="crop-slider"><span>放大取景</span><output>{cropZoom}%</output><input type="range" min="100" max="240" value={cropZoom} onChange={(event) => setCropZoom(Number(event.target.value))} /></label><label className="crop-slider"><span>横向移动</span><output>{cropOffsetX}</output><input type="range" min="-100" max="100" value={cropOffsetX} onChange={(event) => setCropOffsetX(Number(event.target.value))} /></label><label className="crop-slider"><span>纵向移动</span><output>{cropOffsetY}</output><input type="range" min="-100" max="100" value={cropOffsetY} onChange={(event) => setCropOffsetY(Number(event.target.value))} /></label><button className="reset-crop" onClick={() => { setRotation(0); applyDetail(detail, sourceAspect, 0); setCropZoom(100); setCropOffsetX(0); setCropOffsetY(0); }}>恢复原图</button></div>}
+          <div className="generation-actions">
+            {requiresRegeneration && <p className="pending-generation" role="status"><span>设置已更新</span>预览仍是旧图纸；重新生成后才会应用新设置。</p>}
+            <button className="generate-button" onClick={generate} disabled={!imageUrl || isGenerating}><ToolIcon name="sparkle" /> {isGenerating ? (backgroundMode === "ai" ? "AI 正在识别人像…" : "正在生成图纸…") : requiresRegeneration ? "重新生成图纸" : cells.length ? "按当前设置重新生成" : "生成拼豆图纸"}</button>
+            {!imageUrl && <p className="generation-help">先上传图片，即可使用推荐设置生成图纸。</p>}
+          </div>
 
-          {imageUrl && <div className="background-section"><label className="control-label">背景处理 <span>{backgroundMode === "keep" ? "保留" : backgroundMode === "ai" ? "AI 精准抠图" : backgroundMode === "transparent" ? "快速主体保护" : `替换为 ${backgroundCode}`}</span></label><div className="background-options"><button onClick={() => setBackgroundMode("keep")} className={backgroundMode === "keep" ? "selected" : ""}>保留</button><button onClick={() => setBackgroundMode("transparent")} className={backgroundMode === "transparent" ? "selected" : ""}>快速删除</button><button onClick={() => setBackgroundMode("ai")} className={backgroundMode === "ai" ? "selected ai-selected" : ""}>AI 精准</button><button onClick={() => setBackgroundMode("colour")} className={backgroundMode === "colour" ? "selected" : ""}>指定色号</button></div>{backgroundMode === "ai" ? <div className="ai-removal-note" role="status"><strong>AI 人像分割</strong><span>{aiStatus || "识别人物、头发和衣物轮廓；首次使用会下载模型，图片不会上传。"}</span></div> : backgroundMode !== "keep" && <><label className="crop-slider"><span>主体保护</span><output>{subjectProtection}%</output><input type="range" min="0" max="100" value={subjectProtection} onChange={(event) => setSubjectProtection(Number(event.target.value))} aria-label="主体保护强度，数值越高越不容易擦到人物" /></label><label className="crop-slider"><span>识别范围</span><output>{backgroundTolerance}</output><input type="range" min="8" max="55" value={backgroundTolerance} onChange={(event) => setBackgroundTolerance(Number(event.target.value))} aria-label="背景识别范围，数值越高删除越多" /></label>{backgroundMode === "colour" && <label className="background-colour"><span>背景色号</span><select value={backgroundCode} onChange={(event) => setBackgroundCode(event.target.value)}>{PALETTE.map((bead) => <option key={bead.code} value={bead.code}>{bead.code} · {bead.name}</option>)}</select></label>}<p>快速模式从画面边缘开始保守识别，并保护中央主体。人物仍被擦到时提高“主体保护”；背景残留时再提高“识别范围”。</p></>}</div>}
+          {imageUrl && <details className="advanced-settings"><summary>高级调整 <span>裁剪、旋转与背景</span></summary><div className="advanced-settings-content"><div className="crop-section"><label className="control-label">裁剪与旋转 <span>实时预览</span></label><div className="rotation-row"><button onClick={() => setRotation((value) => { const next = (value + 270) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向左旋转 90 度">↶ 向左</button><span>{rotation === 0 ? "原始方向" : `已旋转 ${rotation}°`}</span><button onClick={() => setRotation((value) => { const next = (value + 90) % 360; applyDetail(detail, sourceAspect, next); return next; })} title="向右旋转 90 度">向右 ↷</button></div><label className="crop-slider"><span>放大取景</span><output>{cropZoom}%</output><input type="range" min="100" max="240" value={cropZoom} onChange={(event) => setCropZoom(Number(event.target.value))} /></label><label className="crop-slider"><span>横向移动</span><output>{cropOffsetX}</output><input type="range" min="-100" max="100" value={cropOffsetX} onChange={(event) => setCropOffsetX(Number(event.target.value))} /></label><label className="crop-slider"><span>纵向移动</span><output>{cropOffsetY}</output><input type="range" min="-100" max="100" value={cropOffsetY} onChange={(event) => setCropOffsetY(Number(event.target.value))} /></label><button className="reset-crop" onClick={() => { setRotation(0); applyDetail(detail, sourceAspect, 0); setCropZoom(100); setCropOffsetX(0); setCropOffsetY(0); }}>恢复原图</button></div>
+
+          <div className="background-section"><label className="control-label">背景处理 <span>{backgroundMode === "keep" ? "保留" : backgroundMode === "ai" ? "AI 人像分割" : backgroundMode === "transparent" ? "快速主体保护" : `替换为 ${backgroundCode}`}</span></label><div className="background-options"><button onClick={() => setBackgroundMode("keep")} className={backgroundMode === "keep" ? "selected" : ""}>保留</button><button onClick={() => setBackgroundMode("transparent")} className={backgroundMode === "transparent" ? "selected" : ""}>快速删除</button><button onClick={() => setBackgroundMode("ai")} className={backgroundMode === "ai" ? "selected ai-selected" : ""}>AI 人像</button><button onClick={() => setBackgroundMode("colour")} className={backgroundMode === "colour" ? "selected" : ""}>指定色号</button></div>{backgroundMode === "ai" ? <div className="ai-removal-note" role="status"><strong>AI 人像分割</strong><span>{aiStatus || "适合单个、轮廓清楚的人像。首次使用会下载模型，图片不会上传；宠物、花草或物品请使用“快速删除”。"}</span></div> : backgroundMode !== "keep" && <><label className="crop-slider"><span>主体保护</span><output>{subjectProtection}%</output><input type="range" min="0" max="100" value={subjectProtection} onChange={(event) => setSubjectProtection(Number(event.target.value))} aria-label="主体保护强度，数值越高越不容易擦到人物" /></label><label className="crop-slider"><span>识别范围</span><output>{backgroundTolerance}</output><input type="range" min="8" max="55" value={backgroundTolerance} onChange={(event) => setBackgroundTolerance(Number(event.target.value))} aria-label="背景识别范围，数值越高删除越多" /></label>{backgroundMode === "colour" && <label className="background-colour"><span>背景色号</span><select value={backgroundCode} onChange={(event) => setBackgroundCode(event.target.value)}>{PALETTE.map((bead) => <option key={bead.code} value={bead.code}>{bead.code} · {bead.name}</option>)}</select></label>}<p>快速模式从画面边缘开始保守识别，并保护中央主体。人物仍被擦到时提高“主体保护”；背景残留时再提高“识别范围”。</p></>}</div></div></details>}
           {aiError && <p className="ai-removal-error" role="alert">{aiError}</p>}
 
-          <div className="notice"><span>i</span><p>已使用 MARD 221 色号：A26、B32、C29、D26、E24、F25、G21、H23、M15。图片仅在本地处理。</p></div>
+          <div className="notice"><span>i</span><p>图纸会从 MARD 221 色卡中匹配颜色；你的图片和草稿都只保存在当前设备。</p></div>
           {lockedCodes.length > maxColors && <p className="lock-warning">已锁定 {lockedCodes.length} 色，会超过当前颜色上限。</p>}
-          <button className="generate-button" onClick={generate} disabled={!imageUrl || isGenerating}><ToolIcon name="sparkle" /> {isGenerating ? (backgroundMode === "ai" ? "AI 正在识别主体…" : "正在生成图纸…") : requiresRegeneration ? "按新设置重新生成" : "生成拼豆图纸"}</button>
-          {cells.length > 0 && <button className="sidebar-export" onClick={exportPng}><span>导出我的作品</span><ToolIcon name="arrow" /></button>}
         </aside>
 
         <aside className="tool-rail" aria-label="图纸编辑工具">
@@ -821,12 +921,12 @@ export default function Home() {
 
         <div className="workbench-column">
         <section className="preview-panel">
-          <div className="preview-toolbar"><div><div className="eyebrow">工作台</div><h1>{projectName || "未命名图纸"}</h1><p>{cells.length ? `${generatedColumns} × ${generatedRows} 格 · ${counts.length} 种颜色 · ${nonEmpty.toLocaleString()} 颗豆${requiresRegeneration ? ` · 新设置 ${columns} × ${rows} 待生成` : ""}` : "上传一张图片，开始制作拼豆图纸"}</p></div><div className="view-switch"><button className={activeView === "pattern" ? "active" : ""} onClick={() => setActiveView("pattern")}>图纸</button><button className={activeView === "source" ? "active" : ""} onClick={() => setActiveView("source")} disabled={!imageUrl} title={!imageUrl ? "原图未随草稿保存，请重新上传图片后查看" : "查看原图"}>原图</button></div></div>
+          <div className="preview-toolbar"><div><div className="eyebrow">{cells.length ? "第 3 步 · 校对与编辑" : "第 3 步 · 预览结果"}</div><h1>{projectName || "未命名图纸"}</h1><p>{cells.length ? `${generatedColumns} × ${generatedRows} 格 · ${counts.length} 种颜色 · ${nonEmpty.toLocaleString()} 颗豆${requiresRegeneration ? " · 设置已更新，等待重新生成" : ""}` : imageUrl ? "已载入原图；确认设置后即可生成图纸。" : "先在右侧上传图片并设定图纸规格。"}</p></div><div className="view-switch"><button className={activeView === "pattern" ? "active" : ""} onClick={() => setActiveView("pattern")}>图纸</button><button className={activeView === "source" ? "active" : ""} onClick={() => setActiveView("source")} disabled={!imageUrl} title={!imageUrl ? "原图未随草稿保存，请重新上传图片后查看" : "查看原图"}>原图</button></div></div>
           {cells.length > 0 && !imageUrl && <p className="source-unavailable" role="status">原图未随本机草稿保存。重新上传图片后，可查看原图并重新生成图纸。</p>}
-          {cells.length > 0 && <><div className="editor-toolbar colour-strip"><label className="colour-picker"><i style={{ backgroundColor: selectedBead.hex }} /><span>当前色号</span><select value={selectedCode} onChange={(event) => { setSelectedCode(event.target.value); setTool("brush"); }} aria-label="选择拼豆色号">{PALETTE.map((bead) => <option key={bead.code} value={bead.code}>{bead.code} · {bead.name}</option>)}</select></label><button className={`lock-colour ${lockedCodes.includes(selectedCode) ? "locked" : ""}`} onClick={toggleLockedColour}>{lockedCodes.includes(selectedCode) ? `已锁定 ${selectedCode}` : `锁定 ${selectedCode}`}</button><span className="edit-hint">点击或拖拽网格进行修改</span></div><div className="grid-navigator"><span>定位到</span><label>行<input type="number" inputMode="numeric" min="1" max={generatedRows} value={jumpRow} onChange={(event) => setJumpRow(Number(event.target.value))} /></label><label>列<input type="number" inputMode="numeric" min="1" max={generatedColumns} value={jumpColumn} onChange={(event) => setJumpColumn(Number(event.target.value))} /></label><button onClick={jumpToGrid}>跳转</button><button onClick={() => { setJumpRow(1); setJumpColumn(1); stageRef.current?.scrollTo({ top: 0, left: 0, behavior: "smooth" }); }}>回到左上</button><span className="colour-summary">实际使用：{counts.slice(0, 8).map(({ bead }) => bead.code).join("、")}{counts.length > 8 ? ` 等 ${counts.length} 色` : ""}</span></div></>}
+          {cells.length > 0 && <><div className="editor-toolbar colour-strip"><label className="colour-picker"><i style={{ backgroundColor: selectedBead.hex }} /><span>当前色号</span><select value={selectedCode} onChange={(event) => { setSelectedCode(event.target.value); setTool("brush"); }} aria-label="选择拼豆色号">{PALETTE.map((bead) => <option key={bead.code} value={bead.code}>{bead.code} · {bead.name}</option>)}</select></label><button className={`lock-colour ${lockedCodes.includes(selectedCode) ? "locked" : ""}`} onClick={toggleLockedColour}>{lockedCodes.includes(selectedCode) ? `已锁定 ${selectedCode}` : `锁定 ${selectedCode}`}</button><span className="edit-hint">点击或拖拽网格进行修改；键盘可用方向键移动焦点</span></div><div className="grid-navigator"><span>定位到</span><label>行<input type="number" inputMode="numeric" min="1" max={generatedRows} value={jumpRow} onChange={(event) => setJumpRow(Number(event.target.value))} /></label><label>列<input type="number" inputMode="numeric" min="1" max={generatedColumns} value={jumpColumn} onChange={(event) => setJumpColumn(Number(event.target.value))} /></label><button onClick={jumpToGrid}>跳转</button><button onClick={() => { setJumpRow(1); setJumpColumn(1); stageRef.current?.scrollTo({ top: 0, left: 0, behavior: "smooth" }); }}>回到左上</button><span className="colour-summary">实际使用：{counts.slice(0, 8).map(({ bead }) => bead.code).join("、")}{counts.length > 8 ? ` 等 ${counts.length} 色` : ""}</span></div><p className="sr-only" id="grid-keyboard-help">使用方向键在图纸中移动焦点，按 Enter 或空格键按当前工具编辑该格。</p></>}
           <div className="drafting-surface"><div className="canvas-stage" ref={stageRef}>
-            {activeView === "source" && imageUrl ? <div className="source-crop-frame" style={{ width: `${sourcePreviewWidth}px`, aspectRatio: `${columns} / ${rows}` }}><img className="source-image" src={imageUrl} alt="上传的参考图片" style={{ transform: `translate(${(-cropOffsetX * (cropZoom - 100)) / 100}%, ${(-cropOffsetY * (cropZoom - 100)) / 100}%) rotate(${rotation}deg) scale(${cropZoom / 100})` }} /><div className="crop-frame-label">当前取景将用于生成图纸</div></div> : cells.length ? (
-              <div className="pattern-wrap" style={{ width: previewWidth }}><div className="grid-ruler top-ruler">{Array.from({ length: Math.ceil(generatedColumns / 5) }, (_, index) => <span key={index}>{index * 5 + 1}</span>)}</div><div className="grid-ruler side-ruler">{Array.from({ length: Math.ceil(generatedRows / 5) }, (_, index) => <span key={index}>{index * 5 + 1}</span>)}</div><div className={`bead-grid editing-${tool}`} style={gridStyle} onPointerUp={() => { isPainting.current = false; }} onPointerLeave={() => { isPainting.current = false; }}>{cells.map((bead, index) => <button title={bead?.code ?? "透明区域"} aria-label={`${bead?.code ?? "透明区域"}，${tool === "brush" ? "点击替换" : tool === "eraser" ? "点击删除" : "点击读取色号"}`} className={`bead-cell ${bead ? "" : "empty"} ${index % generatedColumns === 0 ? "major-left" : ""} ${Math.floor(index / generatedColumns) % 5 === 0 ? "major-top" : ""}`} key={index} style={{ backgroundColor: bead?.hex, fontSize: `${cellFontSize}px` }} onPointerDown={(event) => { event.preventDefault(); isPainting.current = true; editCell(index); }} onPointerEnter={() => { if (isPainting.current && tool !== "eyedropper") editCell(index); }} onClick={(event) => { if (event.detail === 0) editCell(index); }}>{bead?.code}</button>)}</div></div>
+            {activeView === "source" && imageUrl ? <div className="source-crop-frame" style={{ width: `${sourcePreviewWidth}px`, aspectRatio: `${columns} / ${rows}` }}>{/* Local Blob URLs are intentionally rendered directly; they never leave the device. */}<img className="source-image" src={imageUrl} alt="上传的参考图片" style={{ transform: `translate(${(-cropOffsetX * (cropZoom - 100)) / 100}%, ${(-cropOffsetY * (cropZoom - 100)) / 100}%) rotate(${rotation}deg) scale(${cropZoom / 100})` }} /><div className="crop-frame-label">当前取景将用于生成图纸</div></div> : cells.length ? (
+              <div className="pattern-wrap" style={{ width: previewWidth }}><div className="grid-ruler top-ruler">{Array.from({ length: Math.ceil(generatedColumns / 5) }, (_, index) => <span key={index}>{index * 5 + 1}</span>)}</div><div className="grid-ruler side-ruler">{Array.from({ length: Math.ceil(generatedRows / 5) }, (_, index) => <span key={index}>{index * 5 + 1}</span>)}</div><div className={`bead-grid editing-${tool}`} style={gridStyle} onPointerUp={() => { isPainting.current = false; }} onPointerLeave={() => { isPainting.current = false; }}>{cells.map((bead, index) => <button id={`bead-cell-${index}`} tabIndex={index === focusedCell ? 0 : -1} title={bead?.code ?? "透明区域"} aria-describedby="grid-keyboard-help" aria-label={`${bead?.code ?? "透明区域"}，${tool === "brush" ? "点击替换" : tool === "eraser" ? "点击删除" : "点击读取色号"}`} className={`bead-cell ${bead ? "" : "empty"} ${index % generatedColumns === 0 ? "major-left" : ""} ${Math.floor(index / generatedColumns) % 5 === 0 ? "major-top" : ""}`} key={index} style={{ backgroundColor: bead?.hex, fontSize: `${cellFontSize}px` }} onFocus={() => setFocusedCell(index)} onKeyDown={(event) => moveGridFocus(event, index)} onPointerDown={(event) => { event.preventDefault(); isPainting.current = true; editCell(index); }} onPointerEnter={() => { if (isPainting.current && tool !== "eyedropper") editCell(index); }} onClick={(event) => { if (event.detail === 0) editCell(index); }}>{bead?.code}</button>)}</div></div>
             ) : <div className="empty-state"><div className="empty-tiles"><i /><i /><i /><i /></div><h2>把照片变成可施工的拼豆图纸</h2><p>先上传图片，再选择网格尺寸与颜色数量。</p><button className="outline-button" onClick={() => fileInput.current?.click()}>选择图片</button></div>}
           </div>
           <div className="preview-footer"><span><b>10</b> 格分区线</span><span><b>5</b> 格辅助线</span><span>色号显示：开启</span><div className="zoom-controls" role="group" aria-label="图纸缩放"><button onClick={() => setZoom((value) => Math.max(25, value - 25))} disabled={zoom <= 25} aria-label="缩小图纸">−</button><input type="range" min="25" max="300" step="5" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} aria-label="图纸缩放比例" /><output aria-live="polite">{zoom}%</output><button onClick={() => setZoom((value) => Math.min(300, value + 25))} disabled={zoom >= 300} aria-label="放大图纸">＋</button><button className="fit-button" onClick={fitGridToStage}>适配视图</button></div></div></div>
